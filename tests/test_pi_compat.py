@@ -740,6 +740,7 @@ def test_deploy_runs_bounded_silent_local_pose_acceptance_before_service() -> No
     endpoint = "Tailnet status endpoint failed Pi-local-pose readiness"
 
     assert acceptance in deploy
+    assert 'pose_check=$(\n    cd "$app"\n    timeout 45 runuser -u pi --' in deploy
     assert "timeout 45 runuser -u pi" in deploy
     assert '"service": "recoverybox-pi-v4l2-ncnn-check/v1"' in deploy
     assert '"capture": "v4l2-mmap-yuyv"' in deploy

@@ -1431,8 +1431,11 @@ set -a
 set +a
 export PYTHONPATH="$app/src"
 export PYTHONDONTWRITEBYTECODE=1
-pose_check=$(timeout 45 runuser -u pi -- \
-    /usr/bin/python3 -m recoverybox.device.pi_pose_v4l2 --max-frames 3)
+pose_check=$(
+    cd "$app"
+    timeout 45 runuser -u pi -- \
+        /usr/bin/python3 -m recoverybox.device.pi_pose_v4l2 --max-frames 3
+)
 python3 - "$pose_check" <<'PY'
 import json
 import math
