@@ -556,6 +556,8 @@ def test_deploy_builds_fresh_silent_pi_local_pose_environment() -> None:
     assert deploy.count('/bin/bash "$verifier" "$assets" root:root') == 1
     assert deploy.count('/bin/bash "$asset_verifier"') == 2
     assert deploy.count('/bin/bash "$asset_verifier_source"') == 2
+    assert '[ -f "$asset_verifier" ] && [ ! -L "$asset_verifier" ]' in deploy
+    assert '[ -x "$asset_verifier" ]' not in deploy
     assert (
         '"$admin_target" /bin/bash \\\n'
         '    "$remote_asset_verify_stage" "$REMOTE_ROOT" root:root'

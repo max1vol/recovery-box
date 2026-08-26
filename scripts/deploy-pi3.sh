@@ -945,6 +945,10 @@ asset_verifier=$8
 expected_marker=$9
 legacy_root=${10}
 new_root=0
+activation_fail() {
+    printf 'RecoveryBox app activation rejected: %s\n' "$1" >&2
+    exit 1
+}
 reject_target_or_descendant_mounts() {
     target=$1
     mount_targets=$(LC_ALL=C findmnt --raw --noheadings --output TARGET) || {
@@ -960,9 +964,7 @@ reject_target_or_descendant_mounts() {
     fi
 }
 cleanup_failed_activation() {
-    result=$1
-    failed_line=$2
-    failed_command=$3
+    result=$?
     trap - EXIT
     if [ "$result" -ne 0 ] && [ "$new_root" -eq 1 ] &&
         [ "$root" = /opt/recoverybox ] && [ -d "$root" ] && [ ! -L "$root" ] &&
@@ -973,33 +975,58 @@ cleanup_failed_activation() {
         reject_target_or_descendant_mounts "$root"
         rm -rf --one-file-system -- "$root"
     fi
-    if [ "$result" -ne 0 ]; then
-        printf 'RecoveryBox app activation failed at remote line %s: %s\n' \
-            "$failed_line" "$failed_command" >&2
-    fi
     exit "$result"
 }
-trap 'cleanup_failed_activation "$?" "$LINENO" "$BASH_COMMAND"' EXIT
-[ "$(id -u)" -eq 0 ] || exit 1
-[ "$(tr -d '\n' </etc/machine-id)" = "$expected_machine_id" ] || exit 1
-tailscale ip -4 | grep -Fqx "$expected_ip" || exit 1
-[ "$root" = /opt/recoverybox ] && [ "$app" = "$root/app" ] || exit 1
-case "$stage" in /run/recoverybox-deploy-*/app) ;; *) exit 1 ;; esac
-case "$asset_stage" in /run/recoverybox-deploy-*/assets) ;; *) exit 1 ;; esac
-[ "${stage%/app}" = "${asset_stage%/assets}" ] || exit 1
-[ -d "$stage" ] && [ ! -L "$stage" ] || exit 1
-[ -d "$asset_stage" ] && [ ! -L "$asset_stage" ] || exit 1
-[ -x "$asset_verifier" ] && [ ! -L "$asset_verifier" ] || exit 1
-[ "$(stat -c %U:%G "$stage")" = root:root ] || exit 1
-[ "$(stat -c %U:%G "$asset_stage")" = root:root ] || exit 1
+trap cleanup_failed_activation EXIT
+[ "$(id -u)" -eq 0 ] || activation_fail "root authority was lost"
+[ "$(tr -d '\n' </etc/machine-id)" = "$expected_machine_id" ] ||
+    activation_fail "Pi identity changed"
+tailscale ip -4 | grep -Fqx "$expected_ip" ||
+    activation_fail "Pi Tailnet identity changed"
+[ "$root" = /opt/recoverybox ] && [ "$app" = "$root/app" ] ||
+    activation_fail "canonical app paths changed"
+case "$stage" in
+    /run/recoverybox-deploy-*/app) ;;
+    *) activation_fail "application stage path is outside the deployment root" ;;
+esac
+case "$asset_stage" in
+    /run/recoverybox-deploy-*/assets) ;;
+    *) activation_fail "asset stage path is outside the deployment root" ;;
+esac
+[ "${stage%/app}" = "${asset_stage%/assets}" ] ||
+    activation_fail "application and asset stages do not share one root"
+[ -d "$stage" ] && [ ! -L "$stage" ] ||
+    activation_fail "application stage is not a real directory"
+[ -d "$asset_stage" ] && [ ! -L "$asset_stage" ] ||
+    activation_fail "asset stage is not a real directory"
+[ -f "$asset_verifier" ] && [ ! -L "$asset_verifier" ] ||
+    activation_fail "asset verifier is not a trusted regular file"
+[ "$(stat -c %U:%G "$asset_verifier")" = root:root ] ||
+    activation_fail "asset verifier is not root-owned"
+[ "$(stat -c %a "$asset_verifier")" = 755 ] ||
+    activation_fail "asset verifier has an unexpected mode"
+[ "$(stat -c %h "$asset_verifier")" = 1 ] ||
+    activation_fail "asset verifier is hard-linked"
+[ "$(stat -c %U:%G "$stage")" = root:root ] ||
+    activation_fail "application stage is not root-owned"
+[ "$(stat -c %U:%G "$asset_stage")" = root:root ] ||
+    activation_fail "asset stage is not root-owned"
 if [ -e "$root" ] || [ -L "$root" ]; then
-    [ -d "$root" ] && [ ! -L "$root" ] || exit 1
-    [ "$(readlink -f "$root")" = "$root" ] || exit 1
-    [ "$(stat -c %U:%G "$root")" = root:root ] || exit 1
-    [ "$(stat -c %a "$root")" = 755 ] || exit 1
+    [ -d "$root" ] && [ ! -L "$root" ] ||
+        activation_fail "existing managed root is not a real directory"
+    [ "$(readlink -f "$root")" = "$root" ] ||
+        activation_fail "existing managed root is not canonical"
+    [ "$(stat -c %U:%G "$root")" = root:root ] ||
+        activation_fail "existing managed root is not root-owned"
+    [ "$(stat -c %a "$root")" = 755 ] ||
+        activation_fail "existing managed root has an unexpected mode"
     marker="$root/.recoverybox-managed-v2"
-    [ -f "$marker" ] && [ ! -L "$marker" ] || exit 1
-    case "$(cat "$marker")" in recoverybox-managed-v2:*) ;; *) exit 1 ;; esac
+    [ -f "$marker" ] && [ ! -L "$marker" ] ||
+        activation_fail "existing managed root lacks its marker"
+    case "$(cat "$marker")" in
+        recoverybox-managed-v2:*) ;;
+        *) activation_fail "existing managed root has an invalid marker" ;;
+    esac
     reject_target_or_descendant_mounts "$root"
     rm -rf --one-file-system -- "$root"
 fi
@@ -1011,35 +1038,47 @@ mv -- "$stage" "$app"
 mv -- "$asset_stage/runtime" "$root/runtime"
 mv -- "$asset_stage/models" "$root/models"
 rmdir -- "$asset_stage"
-[ "$(stat -c %U:%G "$app")" = root:root ] || exit 1
+[ "$(stat -c %U:%G "$app")" = root:root ] ||
+    activation_fail "activated application is not root-owned"
 chmod -R u=rwX,go=rX "$app"
-[ "$(stat -c %a "$app")" = 755 ] || exit 1
-if find "$app" ! -user root -print -quit | grep -q .; then exit 1; fi
+[ "$(stat -c %a "$app")" = 755 ] ||
+    activation_fail "activated application root has an unexpected mode"
+if find "$app" ! -user root -print -quit | grep -q .; then
+    activation_fail "activated application contains a non-root-owned inode"
+fi
 if find "$app" \( -type d -o -type f \) -perm /0022 -print -quit | grep -q .; then
-    exit 1
+    activation_fail "activated application contains a writable inode"
 fi
 /bin/bash "$asset_verifier" "$root" root:root
 
 # This is the exact pre-migration RecoveryBox tree. It is destroyed after the
 # new root-owned inodes are canonical; nothing is copied from it or retained.
 if [ -e "$legacy_root" ] || [ -L "$legacy_root" ]; then
-    [ "$legacy_root" = "/home/$expected_user/recoverybox" ] || exit 1
-    [ -d "$legacy_root" ] && [ ! -L "$legacy_root" ] || exit 1
-    [ "$(readlink -f "$legacy_root")" = "$legacy_root" ] || exit 1
+    [ "$legacy_root" = "/home/$expected_user/recoverybox" ] ||
+        activation_fail "legacy application path changed"
+    [ -d "$legacy_root" ] && [ ! -L "$legacy_root" ] ||
+        activation_fail "legacy application is not a real directory"
+    [ "$(readlink -f "$legacy_root")" = "$legacy_root" ] ||
+        activation_fail "legacy application path is not canonical"
     owner=$(stat -c %U:%G "$legacy_root")
     mode=$(stat -c %a "$legacy_root")
     if [ "$owner" != "${expected_user}:${expected_user}" ] || [ "$mode" != 700 ]; then
-        [ "$owner" = "root:${expected_user}" ] && [ "$mode" = 1770 ] || exit 1
+        [ "$owner" = "root:${expected_user}" ] && [ "$mode" = 1770 ] ||
+            activation_fail "legacy application owner or mode changed"
     fi
     marker="$legacy_root/.recoverybox-managed-v1"
-    [ -f "$marker" ] && [ ! -L "$marker" ] || exit 1
-    [ "$(cat "$marker")" = recoverybox-managed-v1 ] || exit 1
+    [ -f "$marker" ] && [ ! -L "$marker" ] ||
+        activation_fail "legacy application lacks its marker"
+    [ "$(cat "$marker")" = recoverybox-managed-v1 ] ||
+        activation_fail "legacy application marker changed"
     reject_target_or_descendant_mounts "$legacy_root"
     rm -rf --one-file-system -- "$legacy_root"
 fi
-[ ! -e "$legacy_root/app" ] && [ ! -L "$legacy_root/app" ] || exit 1
+[ ! -e "$legacy_root/app" ] && [ ! -L "$legacy_root/app" ] ||
+    activation_fail "legacy application survived deletion"
 [ ! -e "$legacy_root/config/recoverybox.env" ] &&
-    [ ! -L "$legacy_root/config/recoverybox.env" ] || exit 1
+    [ ! -L "$legacy_root/config/recoverybox.env" ] ||
+    activation_fail "legacy configuration survived deletion"
 trap - EXIT
 REMOTE_ACTIVATE_APP
 
