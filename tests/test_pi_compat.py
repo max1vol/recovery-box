@@ -558,27 +558,19 @@ def test_deploy_builds_fresh_silent_pi_local_pose_environment() -> None:
     assert deploy.count('/bin/bash "$asset_verifier_source"') == 2
     assert '[ -f "$asset_verifier" ] && [ ! -L "$asset_verifier" ]' in deploy
     assert '[ -x "$asset_verifier" ]' not in deploy
-    assert (
-        "assert_unit_word_set recoverybox.service RestrictAddressFamilies"
-        in deploy
-    )
-    assert (
-        "assert_unit_word_set recoverybox-status.service RestrictAddressFamilies"
-        in deploy
-    )
+    assert "assert_unit_word_set recoverybox.service RestrictAddressFamilies" in deploy
+    assert "assert_unit_word_set recoverybox-status.service RestrictAddressFamilies" in deploy
     assert "assert_unit_ip_deny_any recoverybox.service" in deploy
     assert "assert_unit_ip_deny_any recoverybox-status.service" in deploy
     assert "assert_unit_property recoverybox.service IPAddressDeny any" not in deploy
     assert (
-        '"$admin_target" /bin/bash \\\n'
-        '    "$remote_asset_verify_stage" "$REMOTE_ROOT" root:root'
+        '"$admin_target" /bin/bash \\\n    "$remote_asset_verify_stage" "$REMOTE_ROOT" root:root'
     ) in deploy
     assert '\n"$verifier" "$assets" root:root' not in deploy
     assert '\n"$asset_verifier"' not in deploy
     assert '\n"$asset_verifier_source"' not in deploy
     assert (
-        '"$admin_target" \\\n'
-        '    "$remote_asset_verify_stage" "$REMOTE_ROOT" root:root'
+        '"$admin_target" \\\n    "$remote_asset_verify_stage" "$REMOTE_ROOT" root:root'
     ) not in deploy
     assert "DevicePolicy=closed" in deploy
     assert 'b"OPENAI_API_KEY" in environment' in deploy
@@ -743,7 +735,11 @@ def test_deploy_runs_bounded_silent_local_pose_acceptance_before_service() -> No
     assert 'pose_check=$(\n    cd "$app"\n    timeout 45 runuser -u pi --' in deploy
     assert ") || pose_check_status=$?" in deploy
     assert 'python3 - "$pose_check" "$pose_check_status"' in deploy
-    assert 'print(f"Pi pose acceptance failed: {failure}", file=sys.stderr)' in deploy
+    assert (
+        'numeric_fields = ("frames_received", "fresh_frames", "timeouts", "inference_ms_max")'
+        in deploy
+    )
+    assert 'f"Pi pose acceptance failed: {failure}; "' in deploy
     assert "timeout 45 runuser -u pi" in deploy
     assert '"service": "recoverybox-pi-v4l2-ncnn-check/v1"' in deploy
     assert '"capture": "v4l2-mmap-yuyv"' in deploy

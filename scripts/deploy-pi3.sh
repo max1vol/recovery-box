@@ -1458,7 +1458,22 @@ if pose_check_status != 0:
         or re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,63}", failure) is None
     ):
         raise SystemExit(1)
-    print(f"Pi pose acceptance failed: {failure}", file=sys.stderr)
+    numeric_fields = ("frames_received", "fresh_frames", "timeouts", "inference_ms_max")
+    numeric_summary = []
+    for name in numeric_fields:
+        value = report.get(name)
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise SystemExit(1)
+        numeric_summary.append(f"{name}={value}")
+    print(
+        f"Pi pose acceptance failed: {failure}; " + " ".join(numeric_summary),
+        file=sys.stderr,
+    )
     raise SystemExit(1)
 expected = {
     "service": "recoverybox-pi-v4l2-ncnn-check/v1",

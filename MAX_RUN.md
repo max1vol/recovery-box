@@ -86,11 +86,18 @@ running it:
 Run the read-only preflight first:
 
 ```bash
+ssh root@100.106.237.106 'vcgencmd get_throttled'
 scripts/deploy-pi3.sh
 ```
 
-Only after it succeeds, load `.env` into the current shell and apply the direct
-replacement:
+After a fresh reboot, `get_throttled` must report `0x0`. If its low bits are
+non-zero—especially a result ending in `5`—replace or reseat the Pi power
+supply/cable before continuing; active undervoltage/throttling can make pose
+evidence miss the Guardian's fixed 500 ms deadline and can drop SSH entirely.
+Do not increase that safety deadline.
+
+Only after power and the read-only preflight both pass, load `.env` into the
+current shell and apply the direct replacement:
 
 ```bash
 set -a
