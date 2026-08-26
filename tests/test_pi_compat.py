@@ -559,6 +559,14 @@ def test_deploy_builds_fresh_silent_pi_local_pose_environment() -> None:
     assert '[ -f "$asset_verifier" ] && [ ! -L "$asset_verifier" ]' in deploy
     assert '[ -x "$asset_verifier" ]' not in deploy
     assert (
+        "assert_unit_word_set recoverybox.service RestrictAddressFamilies"
+        in deploy
+    )
+    assert (
+        "assert_unit_word_set recoverybox-status.service RestrictAddressFamilies"
+        in deploy
+    )
+    assert (
         '"$admin_target" /bin/bash \\\n'
         '    "$remote_asset_verify_stage" "$REMOTE_ROOT" root:root'
     ) in deploy

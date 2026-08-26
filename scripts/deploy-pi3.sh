@@ -1312,6 +1312,25 @@ assert_unit_property() {
     }
 }
 
+assert_unit_word_set() {
+    unit=$1
+    property=$2
+    expected=$3
+    actual=$(systemctl show --property="$property" --value "$unit")
+    normalized_actual=$(
+        printf '%s\n' "$actual" | tr ' ' '\n' | sed '/^$/d' |
+            LC_ALL=C sort | tr '\n' ' '
+    )
+    normalized_expected=$(
+        printf '%s\n' "$expected" | tr ' ' '\n' | sed '/^$/d' |
+            LC_ALL=C sort | tr '\n' ' '
+    )
+    [ "$normalized_actual" = "$normalized_expected" ] || {
+        printf '%s has unexpected effective %s\n' "$unit" "$property" >&2
+        exit 1
+    }
+}
+
 assert_unit_property recoverybox.service FragmentPath "$main_target"
 assert_unit_property recoverybox-status.service FragmentPath "$status_target"
 assert_unit_property recoverybox.service User pi
@@ -1343,8 +1362,8 @@ assert_unit_property recoverybox.service ReadOnlyPaths \
 assert_unit_property recoverybox-status.service ReadOnlyPaths \
     '/opt/recoverybox/app /run/recoverybox'
 assert_unit_property recoverybox-status.service InaccessiblePaths /etc/recoverybox/credentials
-assert_unit_property recoverybox.service RestrictAddressFamilies 'AF_UNIX AF_INET AF_INET6'
-assert_unit_property recoverybox-status.service RestrictAddressFamilies 'AF_UNIX AF_INET AF_INET6'
+assert_unit_word_set recoverybox.service RestrictAddressFamilies 'AF_UNIX AF_INET AF_INET6'
+assert_unit_word_set recoverybox-status.service RestrictAddressFamilies 'AF_UNIX AF_INET AF_INET6'
 assert_unit_property recoverybox.service IPAddressDeny any
 assert_unit_property recoverybox-status.service IPAddressDeny any
 assert_unit_property recoverybox.service IPAddressAllow 100.64.0.0/10
