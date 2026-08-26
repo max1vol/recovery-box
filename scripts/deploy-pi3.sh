@@ -1331,6 +1331,22 @@ assert_unit_word_set() {
     }
 }
 
+assert_unit_ip_deny_any() {
+    unit=$1
+    actual=$(systemctl show --property=IPAddressDeny --value "$unit")
+    if [ "$actual" = any ]; then
+        return
+    fi
+    normalized_actual=$(
+        printf '%s\n' "$actual" | tr ' ' '\n' | sed '/^$/d' |
+            LC_ALL=C sort | tr '\n' ' '
+    )
+    [ "$normalized_actual" = '0.0.0.0/0 ::/0 ' ] || {
+        printf '%s has unexpected effective IPAddressDeny\n' "$unit" >&2
+        exit 1
+    }
+}
+
 assert_unit_property recoverybox.service FragmentPath "$main_target"
 assert_unit_property recoverybox-status.service FragmentPath "$status_target"
 assert_unit_property recoverybox.service User pi
@@ -1364,10 +1380,10 @@ assert_unit_property recoverybox-status.service ReadOnlyPaths \
 assert_unit_property recoverybox-status.service InaccessiblePaths /etc/recoverybox/credentials
 assert_unit_word_set recoverybox.service RestrictAddressFamilies 'AF_UNIX AF_INET AF_INET6'
 assert_unit_word_set recoverybox-status.service RestrictAddressFamilies 'AF_UNIX AF_INET AF_INET6'
-assert_unit_property recoverybox.service IPAddressDeny any
-assert_unit_property recoverybox-status.service IPAddressDeny any
-assert_unit_property recoverybox.service IPAddressAllow 100.64.0.0/10
-assert_unit_property recoverybox-status.service IPAddressAllow 100.64.0.0/10
+assert_unit_ip_deny_any recoverybox.service
+assert_unit_ip_deny_any recoverybox-status.service
+assert_unit_word_set recoverybox.service IPAddressAllow 100.64.0.0/10
+assert_unit_word_set recoverybox-status.service IPAddressAllow 100.64.0.0/10
 [ "$(systemctl show --property=EnvironmentFiles --value recoverybox.service)" = \
     '/etc/recoverybox/recoverybox.env (ignore_errors=no)' ] || exit 1
 [ "$(systemctl show --property=EnvironmentFiles --value recoverybox-status.service)" = \

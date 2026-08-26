@@ -566,6 +566,9 @@ def test_deploy_builds_fresh_silent_pi_local_pose_environment() -> None:
         "assert_unit_word_set recoverybox-status.service RestrictAddressFamilies"
         in deploy
     )
+    assert "assert_unit_ip_deny_any recoverybox.service" in deploy
+    assert "assert_unit_ip_deny_any recoverybox-status.service" in deploy
+    assert "assert_unit_property recoverybox.service IPAddressDeny any" not in deploy
     assert (
         '"$admin_target" /bin/bash \\\n'
         '    "$remote_asset_verify_stage" "$REMOTE_ROOT" root:root'
