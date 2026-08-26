@@ -1431,20 +1431,35 @@ set -a
 set +a
 export PYTHONPATH="$app/src"
 export PYTHONDONTWRITEBYTECODE=1
+pose_check_status=0
 pose_check=$(
     cd "$app"
     timeout 45 runuser -u pi -- \
         /usr/bin/python3 -m recoverybox.device.pi_pose_v4l2 --max-frames 3
-)
-python3 - "$pose_check" <<'PY'
+) || pose_check_status=$?
+python3 - "$pose_check" "$pose_check_status" <<'PY'
 import json
 import math
+import re
 import sys
 
 try:
     report = json.loads(sys.argv[1])
-except (IndexError, json.JSONDecodeError):
+    pose_check_status = int(sys.argv[2])
+except (IndexError, ValueError, json.JSONDecodeError):
     raise SystemExit(1) from None
+if pose_check_status != 0:
+    failure = report.get("failure")
+    if (
+        report.get("service") != "recoverybox-pi-v4l2-ncnn-check/v1"
+        or report.get("raw_frames_persisted") != 0
+        or report.get("audio") != "disabled"
+        or not isinstance(failure, str)
+        or re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,63}", failure) is None
+    ):
+        raise SystemExit(1)
+    print(f"Pi pose acceptance failed: {failure}", file=sys.stderr)
+    raise SystemExit(1)
 expected = {
     "service": "recoverybox-pi-v4l2-ncnn-check/v1",
     "capture": "v4l2-mmap-yuyv",

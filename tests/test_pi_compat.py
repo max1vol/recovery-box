@@ -741,6 +741,9 @@ def test_deploy_runs_bounded_silent_local_pose_acceptance_before_service() -> No
 
     assert acceptance in deploy
     assert 'pose_check=$(\n    cd "$app"\n    timeout 45 runuser -u pi --' in deploy
+    assert ") || pose_check_status=$?" in deploy
+    assert 'python3 - "$pose_check" "$pose_check_status"' in deploy
+    assert 'print(f"Pi pose acceptance failed: {failure}", file=sys.stderr)' in deploy
     assert "timeout 45 runuser -u pi" in deploy
     assert '"service": "recoverybox-pi-v4l2-ncnn-check/v1"' in deploy
     assert '"capture": "v4l2-mmap-yuyv"' in deploy
