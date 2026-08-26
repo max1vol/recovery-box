@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from recoverybox.realtime.protocol import REALTIME_WEBSOCKET_URL
+from recoverybox.realtime.protocol import REALTIME_WEBSOCKET_URL, RealtimeProtocolError
 from recoverybox.realtime.transport import (
     BoundedOrderedTransport,
     RealtimeTransportBackpressureError,
@@ -17,6 +17,12 @@ from recoverybox.realtime.transport import (
 
 
 class _Connection:
+    def __init__(self) -> None:
+        self.receive_timeouts: list[float | None] = []
+
+    def settimeout(self, timeout: float | None) -> None:
+        self.receive_timeouts.append(timeout)
+
     def close(self) -> None:
         return
 
@@ -64,10 +70,11 @@ def test_realtime_transport_uses_verified_ca_bundle_without_retaining_key(
     monkeypatch,
 ) -> None:
     captured: dict[str, object] = {}
+    connection = _Connection()
 
     def create_connection(url: str, **options: object) -> _Connection:
         captured.update({"url": url, **options})
-        return _Connection()
+        return connection
 
     monkeypatch.setitem(
         sys.modules,
@@ -93,6 +100,17 @@ def test_realtime_transport_uses_verified_ca_bundle_without_retaining_key(
         "timeout": 12.0,
     }
     assert "temporary-secret" not in repr(transport)
+
+    transport.set_receive_timeout(None)
+    assert connection.receive_timeouts == [None]
+
+
+@pytest.mark.parametrize("timeout", [0, -1, True])
+def test_websocket_receive_timeout_requires_positive_or_none(timeout: object) -> None:
+    transport = WebSocketJsonTransport(_Connection())
+
+    with pytest.raises(RealtimeProtocolError, match="positive or None"):
+        transport.set_receive_timeout(timeout)  # type: ignore[arg-type]
 
 
 def test_websocket_transport_prefers_immediate_shutdown_over_close_handshake() -> None:

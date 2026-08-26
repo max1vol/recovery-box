@@ -25,9 +25,19 @@ from recoverybox.realtime.verification import (
 from recoverybox.session import ApprovedCuePlaybackAuthorization, SessionCoordinator
 
 _VERIFICATION_CUES = (
+    CueId.SQUAT_SET_INTRO,
+    CueId.SQUAT_PERSON_DETECTED,
     CueId.SQUAT_REP_ONE,
     CueId.SQUAT_REP_TWO,
-    CueId.ARMS_T_SHAPE,
+    CueId.SQUAT_REP_THREE,
+)
+
+_SIMULATED_EVENTS = (
+    "script_intro_requested",
+    "first_assessable_stand",
+    "squat_rep_completed_1",
+    "squat_rep_completed_2",
+    "squat_rep_completed_3",
 )
 
 _SESSION_INSTRUCTIONS = """
@@ -56,13 +66,13 @@ class _AuthorizationCollector:
 
 
 def build_simulated_squat_authorizations() -> tuple[ApprovedCuePlaybackAuthorization, ...]:
-    """Run semantic squat/form events through the real local Guardian boundary."""
+    """Run the five-stage squat script through its real Guardian boundaries."""
 
     guardian = Guardian()
     plan = ExercisePlan(
-        exercise_id="squat-with-arms-in-t",
+        exercise_id="squat",
         allowed_cue_ids=frozenset(cue.value for cue in _VERIFICATION_CUES),
-        target_reps=10,
+        target_reps=3,
         min_confidence=0.7,
         max_pose_age_ms=500,
         required_camera_views=1,
@@ -70,18 +80,50 @@ def build_simulated_squat_authorizations() -> tuple[ApprovedCuePlaybackAuthoriza
     collector = _AuthorizationCollector()
     coordinator = SessionCoordinator(
         cue_playback=collector,
-        initial_mode=SessionMode.ACTIVE_EXERCISE,
+        initial_mode=SessionMode.CHECK_IN,
     )
 
-    for rep_index, cue_id in enumerate(_VERIFICATION_CUES, start=1):
+    intro = guardian.decide_scripted_session_cue(
+        LocalCueRequest(CueId.SQUAT_SET_INTRO.value),
+        plan,
+    )
+    coordinator.apply_guardian_decision(intro)
+
+    first_stand = MovementObservation(
+        exercise_id=plan.exercise_id,
+        timestamp_ms=1_000,
+        confidence=0.98,
+        camera_view_count=1,
+        camera_disagreement_degrees=None,
+        pose_age_ms=10,
+        rep_index=0,
+        phase="standing",
+    )
+    stand_decision = guardian.decide(first_stand, plan)
+    coordinator.apply_guardian_decision(stand_decision)
+    detected = guardian.decide_scripted_session_cue(
+        LocalCueRequest(CueId.SQUAT_PERSON_DETECTED.value),
+        plan,
+    )
+    coordinator.apply_guardian_decision(detected)
+    coordinator.begin_active_exercise_from_check_in()
+
+    for rep_index, cue_id in enumerate(
+        (
+            CueId.SQUAT_REP_ONE,
+            CueId.SQUAT_REP_TWO,
+            CueId.SQUAT_REP_THREE,
+        ),
+        start=1,
+    ):
         observation = MovementObservation(
             exercise_id=plan.exercise_id,
-            timestamp_ms=rep_index * 1_000,
+            timestamp_ms=(rep_index + 1) * 1_000,
             confidence=0.98,
             camera_view_count=1,
             camera_disagreement_degrees=None,
             pose_age_ms=10,
-            rep_index=min(rep_index, 2),
+            rep_index=rep_index,
             phase="standing",
         )
         decision = guardian.decide(
@@ -147,11 +189,7 @@ def run_live_realtime_verification(
         "connection_lifetime": "one Realtime WebSocket reused for every cue",
         "model": "gpt-realtime-2.1",
         "voice": voice,
-        "simulated_events": [
-            "squat_rep_completed_1",
-            "squat_rep_completed_2",
-            "arms_not_in_t",
-        ],
+        "simulated_events": list(_SIMULATED_EVENTS),
         "reports": [report.to_dict() for report in reports],
     }
     report_path = destination / "report.json"

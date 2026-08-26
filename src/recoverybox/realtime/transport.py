@@ -261,6 +261,25 @@ class WebSocketJsonTransport:
             raise RealtimeProtocolError("WebSocket event JSON must be an object")
         return event
 
+    def set_receive_timeout(self, timeout_seconds: float | None) -> None:
+        """Set the established socket's receive timeout without reconnecting.
+
+        ``connect(timeout_seconds=...)`` bounds the WebSocket handshake but the
+        device workout receiver is intentionally long-lived.  A caller may
+        therefore restore blocking receives with ``None`` after a bounded
+        connection attempt.  Developer tools that need periodic receive
+        wakeups can keep the original finite timeout.
+        """
+
+        if timeout_seconds is not None:
+            if (
+                isinstance(timeout_seconds, bool)
+                or not isinstance(timeout_seconds, (int, float))
+                or timeout_seconds <= 0
+            ):
+                raise RealtimeProtocolError("receive timeout must be positive or None")
+        self._websocket.settimeout(timeout_seconds)
+
     def close(self) -> None:
         self.abort()
 

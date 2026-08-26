@@ -142,7 +142,6 @@ def build_session_update(
         "type": "session.update",
         "session": {
             "type": "realtime",
-            "model": REALTIME_MODEL,
             "output_modalities": ["audio"],
             "instructions": instructions,
             "audio": {

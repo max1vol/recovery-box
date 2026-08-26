@@ -94,7 +94,7 @@ def test_build_composes_manual_24k_realtime_without_exposing_key() -> None:
     session_update = transport.sent[0]
     session = session_update["session"]
     assert session_update["type"] == "session.update"
-    assert session["model"] == "gpt-realtime-2.1"
+    assert "model" not in session
     assert session["audio"]["input"]["turn_detection"] is None
     assert session["audio"]["input"]["format"]["rate"] == 24_000
     assert session["audio"]["output"]["format"]["rate"] == 24_000

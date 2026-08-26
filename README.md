@@ -8,8 +8,8 @@ path. Flower remains a separate post-session training system and never owns the
 live camera or voice loop.
 
 The interactive slice is intentionally narrow: one macOS laptop, one RGB
-camera, one configured ten-repetition squat with arms held in a T shape, and
-one persistent Realtime session. The root Flower FAB remains a separate
+camera, one deterministic three-squat script followed by a T-shape instruction,
+and one persistent Realtime session. The root Flower FAB remains a separate
 three-client `seated-knee-extension` training demonstration, with a second
 read-only clinician-review AgentApp.
 
@@ -45,19 +45,19 @@ with your shell or secret manager, then run:
 uv run recoverybox squat-demo
 ```
 
-RecoveryBox does not load `.env` files. The preview shows the live camera,
-MediaPipe skeleton, and squat count/status overlay. Press `q` or Escape in the
-preview to stop. On macOS, the launching terminal or app must have Camera
-permission; webcam visual acceptance is currently blocked by that permission
-in this environment.
+RecoveryBox does not load `.env` files. The preview is on by default and shows
+the live camera, MediaPipe skeleton, squat count/status, camera-loop FPS and
+capture latency, plus pose-model FPS and inference latency. Press `q` or Escape
+in the preview to stop. On macOS, the launching terminal or app must have
+Camera permission.
 
 ## What is implemented
 
 - An explicit, checksum-verified MediaPipe Pose Landmarker install and a
   webcam adapter with no import-time model download.
 - A deterministic single-camera, 2D squat tracker with standing-down-standing
-  repetition counting, sustained arms-in-T feedback, and fail-closed missing
-  or low-confidence pose handling.
+  repetition counting, a fixed five-cue three-squat choreography, and
+  fail-closed missing or low-confidence pose handling.
 - A strict, versioned three-angle pose contract, conservative dual-camera
   fusion, and a watchdog for the target Pi composition.
 - A numeric-only, identity-free pose window and a validated post-session
@@ -80,7 +80,8 @@ in this environment.
 
 See [the laptop squat runbook](docs/laptop-squat-demo.md),
 [architecture](docs/architecture.md), [safety and privacy case](docs/safety-and-privacy.md),
-and [six-minute demo](docs/hackathon-demo.md).
+[six-minute demo](docs/hackathon-demo.md), and the concise
+[instructions for Max](MAX_RUN.md).
 
 ## Hardware-free checks
 
@@ -118,8 +119,18 @@ speech fallback or voice acceptance test.
 
 The demo uses one Realtime WebSocket and configures one session once. Exercise
 cues and manual audio turns reuse it; a cue uses an isolated response on that
-same socket rather than opening another connection. Completing the tenth rep,
-pausing, silence, or an ordinary response does not end the session. Only a
+same socket rather than opening another connection. The fixed sequence is:
+
+1. welcome Max and introduce a set of three squats;
+2. wait for the first assessable standing pose, acknowledge detection exactly
+   once, and arm counting only after that cue has finished playing and a fresh
+   assessable standing frame arrives;
+3. speak “One.” after rep one and “Slower.” after rep two; and
+4. after rep three, say “Three. Excellent.” and instruct Max to bring both arms
+   out into a T shape.
+
+Completing the third rep and issuing the T-shape instruction does not end the
+session. Pausing, silence, or an ordinary response also leaves it open. Only a
 physical stop or a locally validated, empty `finish_session` tool call is a
 normal end capability. OpenAI documents a 60-minute maximum Realtime-session
 duration, so this one-connection hackathon workout must remain below that cap.
@@ -139,9 +150,10 @@ limitations, and acceptance evidence.
 
 ### Realtime cue verification status
 
-The live verification launcher simulates rep one, rep two, and arms leaving the
-T shape through the real Guardian, then requests all three cues sequentially
-on one Realtime connection:
+The live verification launcher simulates the complete five-stage acceptance
+sequence through the real Guardian: scripted introduction, first assessable
+stand/detection, then completed reps one, two, and three. It requests all five
+fixed cues sequentially on one Realtime connection:
 
 ```bash
 uv run recoverybox verify-realtime-cues \
@@ -151,14 +163,14 @@ uv run recoverybox verify-realtime-cues \
 ```
 
 Only gate-approved PCM can be written as WAV, alongside a content-free
-`report.json`; provider IDs, transcripts, and ASR word text are not persisted.
-The live `gpt-realtime-2.1` run with the `marin` voice succeeded: all three
-Guardian-selected cues passed the completed-transcript exact-phrase gate, and
-all three released cues passed the Whisper ASR check. Safe-release latencies
-were 502 ms, 547 ms, and 740 ms. The report remains a local, ignored artifact
-under `artifacts/`; it is not committed. This verifies the Realtime cue path
-from simulated deterministic exercise events, not the separate webcam visual
-or camera-to-speaker path.
+`report.json`; provider IDs, transcripts, prompt text, and ASR word text are not
+persisted. On 2026-08-25 the current catalog passed all five live completed-
+transcript gates on one `gpt-realtime-2.1`/`marin` connection. Quarantine
+release occurred at 968.160, 941.650, 482.981, 503.155, and 1042.839 ms. That
+run used `--skip-asr`, so independent ASR remains unclaimed. Its ignored report
+is under `artifacts/realtime-verification-three-squat/`. This simulated-event
+evidence still does not establish webcam pose accuracy, audible speaker onset,
+or camera-to-speaker latency.
 
 For the separate Pi check-in developer lane, expose `OPENAI_API_KEY` to its
 service environment and keep the model pinned to `gpt-realtime-2.1`.
@@ -218,8 +230,8 @@ usable without a running Agent runtime.
   unheard portion, and begin a new turn.
 - Recording and playback cannot overlap.
 - During check-in/post-session conversation, model audio may stream under the
-  explicit conversational policy. The accepted 502/547/740 ms values are
-  cue-verification safe-release measurements, not conversational or
+  explicit conversational policy. Prompt-cue verification timings, when
+  freshly measured for the current catalog, are not conversational or
   camera-to-speaker latency.
 - During an active exercise, ordinary model speech is blocked. Fixed cue
   phrases live in a versioned, clinician-reviewed prompt catalog, and only the
@@ -266,18 +278,40 @@ straight into the device runtime. Model signing, a controlled validation gate,
 fleet identity, TLS deployment, regulatory work, and clinical validation remain
 production work.
 
-The laptop squat is not equivalent to the target Pi/two-camera product. Its
+The laptop squat is not equivalent to a multi-camera clinical product. Its
 single RGB view and image-plane angles cannot establish depth, anatomical 3D
 angles, cross-view agreement, load, balance, pain, or general movement safety.
-Concrete Pi GPIO wiring and its long-running hardware composition remain a
-separate integration and acceptance slice.
+The implemented Pi 3 lane owns one USB camera, runs the pinned local
+V4L2/libyuv/NanoDet/RTMPose pipeline, and keeps the deterministic Guardian and
+BCM23 stop input local. A fully framed live person, sustained thermal behavior,
+actual squat counting, and a physical button press remain hardware acceptance
+checks rather than claims established by the unit suite.
 
-The simulated-event Guardian/Realtime verification harness has completed a
-live `gpt-realtime-2.1`/`marin` run: all three exact-phrase gates and all three
-Whisper ASR checks passed, with safe release at 502/547/740 ms. This establishes
-the isolated live cue gate, not end-to-end camera-to-speaker acceptance. Webcam
-visual acceptance remains blocked by macOS camera permission in this
-environment.
+The prior three-cue result is historical. The current five-cue exact-transcript
+gate passed live as documented above; independent ASR was skipped. Webcam
+tracking, audible playback, and camera-to-speaker behavior remain separate
+physical acceptance checks.
+
+## Pi 3 local deployment for Max
+
+Use the [Pi 3 local-pose runbook](docs/pi-mac-pose.md). From the repository root
+on the pinned operator Mac, load Max's ignored local `.env` into the current
+shell, run the read-only preflight, and only then perform the direct replacement:
+
+```bash
+set -a
+. ./.env
+set +a
+scripts/deploy-pi3.sh
+scripts/deploy-pi3.sh --apply
+unset OPENAI_API_KEY
+```
+
+The `.env` file must define `OPENAI_API_KEY`; never commit it or put the key on
+the command line. The deployer sends it once over the pinned Tailscale SSH path
+as a root-only systemd file credential. Production camera and pose inference run
+entirely on the Pi. The Mac camera/preview path is test-only, and the Pi service
+remains silent until audio is explicitly re-enabled in a later reviewed change.
 
 ## Upstream documentation
 

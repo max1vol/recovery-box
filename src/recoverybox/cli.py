@@ -49,7 +49,7 @@ def _parser() -> argparse.ArgumentParser:
     pose_model.add_argument("--output", default=str(DEFAULT_POSE_MODEL_PATH))
     verify = subparsers.add_parser(
         "verify-realtime-cues",
-        help="run three live Realtime cue latency + ASR trials on one connection",
+        help="run five scripted Realtime cue latency + ASR trials on one connection",
     )
     verify.add_argument("--output-dir", default="artifacts/realtime-verification")
     verify.add_argument("--voice", default="marin")
@@ -81,6 +81,16 @@ def _parser() -> argparse.ArgumentParser:
         "--max-frames",
         type=int,
         help="stop after a positive number of frames for a bounded integration run",
+    )
+    squat.add_argument(
+        "--pose-peer",
+        metavar="HOST:PORT",
+        help="publish numeric pose analysis to a RecoveryBox HOST:PORT peer",
+    )
+    squat.add_argument(
+        "--pose-token-file",
+        metavar="PATH",
+        help="read the remote-pose authentication token from this file",
     )
     return parser
 
@@ -145,6 +155,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             no_voice=args.no_voice,
             no_mic=args.no_mic,
             max_frames=args.max_frames,
+            pose_peer=args.pose_peer,
+            pose_token_file=args.pose_token_file,
         )
     raise AssertionError(f"unhandled command: {args.command}")
 

@@ -7,11 +7,9 @@ own a network transport, or write to a speaker.  It schedules typed
 ``RealtimeClientResult`` values from the application's single event dispatcher,
 and hands one atomic, safety-gated PCM clip to a non-blocking callback.
 
-Only one cue response is allowed on the wire at a time.  Pending counts may
-jump ahead of repeated form reminders, but they never preempt an active cue and
-never outrank a safety cue.  Repeated corrections are coalesced by cue ID, and
-pending counts are coalesced to the newest count so delayed speech does not read
-an obsolete backlog.
+Only one cue response is allowed on the wire at a time.  Safety cues retain
+priority, repeated corrections are coalesced by cue ID, and ordered scripted
+cues are preserved FIFO without superseding earlier rep cues.
 """
 
 from __future__ import annotations
@@ -61,9 +59,10 @@ class _CueLane(IntEnum):
     # Lower values are selected first.  A new cue never interrupts the active
     # one, so this ordering applies only to not-yet-requested work.
     SAFETY = 0
-    COUNT = 1
-    CORRECTION = 2
-    OTHER = 3
+    SCRIPT = 1
+    COUNT = 2
+    CORRECTION = 3
+    OTHER = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,6 +226,9 @@ class RealtimeCueDelivery:
         mode_provider: SessionModeProvider,
         on_audio: Callable[[ReleasedCueAudio], None],
         count_cue_ids: Collection[CueId | str] = (),
+        ordered_cue_ids: Collection[CueId | str] = (),
+        allowed_modes: Collection[SessionMode] = (SessionMode.ACTIVE_EXERCISE,),
+        check_in_cue_ids: Collection[CueId | str] = (),
         on_preempt: Callable[[], None] | None = None,
         on_failure: Callable[[CueDeliveryFailure], None] | None = None,
         config: CueDeliveryConfig = DEFAULT_CUE_DELIVERY_CONFIG,
@@ -250,12 +252,39 @@ class RealtimeCueDelivery:
                 raise ValueError("count_cue_ids must contain nonblank cue identifiers")
             normalized_count_ids.add(value.strip())
 
+        normalized_ordered_ids: set[str] = set()
+        for cue_id in ordered_cue_ids:
+            value = cue_id.value if isinstance(cue_id, CueId) else cue_id
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("ordered_cue_ids must contain nonblank cue identifiers")
+            normalized_ordered_ids.add(value.strip())
+
+        normalized_check_in_ids: set[str] = set()
+        for cue_id in check_in_cue_ids:
+            value = cue_id.value if isinstance(cue_id, CueId) else cue_id
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("check_in_cue_ids must contain nonblank cue identifiers")
+            normalized_check_in_ids.add(value.strip())
+
+        normalized_modes = frozenset(allowed_modes)
+        if not normalized_modes or not all(
+            isinstance(mode, SessionMode) for mode in normalized_modes
+        ):
+            raise ValueError("allowed_modes must contain SessionMode values")
+        if not normalized_modes.issubset({SessionMode.CHECK_IN, SessionMode.ACTIVE_EXERCISE}):
+            raise ValueError("prompt cues are limited to CHECK_IN and ACTIVE_EXERCISE")
+        if SessionMode.CHECK_IN in normalized_modes and not normalized_check_in_ids:
+            raise ValueError("CHECK_IN prompt cues require a closed check_in_cue_ids set")
+
         self._session = session
         self._mode_provider = mode_provider
         self._on_audio = on_audio
         self._on_preempt = on_preempt
         self._on_failure = on_failure
         self._count_cue_ids = frozenset(normalized_count_ids)
+        self._ordered_cue_ids = frozenset(normalized_ordered_ids)
+        self._allowed_modes = normalized_modes
+        self._check_in_cue_ids = frozenset(normalized_check_in_ids)
         self._config = config
         self._clock = clock
         self._lock = threading.RLock()
@@ -291,7 +320,7 @@ class RealtimeCueDelivery:
 
         if not isinstance(authorization, ApprovedCuePlaybackAuthorization):
             raise TypeError("authorization must be ApprovedCuePlaybackAuthorization")
-        self._require_active_exercise()
+        self._require_allowed_mode(authorization)
         now = self._now()
         to_request: _CueWork | None = None
 
@@ -301,28 +330,36 @@ class RealtimeCueDelivery:
             self._drop_stale_pending_locked(now)
             lane = self._lane_for(authorization)
 
-            if self._active is not None and self._same_cue(
-                self._active.authorization,
-                authorization,
-            ):
-                self._coalesced_count += 1
-                return CueEnqueueResult(
-                    self._active.ticket_id,
-                    authorization.cue_id,
-                    CueQueueDisposition.COALESCED,
-                )
-
-            for pending in self._pending:
-                if self._same_cue(pending.authorization, authorization):
-                    pending.authorization = authorization
-                    pending.queued_at = now
+            # Each SCRIPT authorization represents one ordered step.  Even a
+            # repeated cue ID must remain distinct; coalescing it would
+            # silently remove a scripted step.  Generic lanes retain their
+            # existing duplicate suppression semantics.
+            if lane is not _CueLane.SCRIPT:
+                if self._active is not None and self._same_cue(
+                    self._active.authorization,
+                    authorization,
+                ):
                     self._coalesced_count += 1
                     return CueEnqueueResult(
-                        pending.ticket_id,
+                        self._active.ticket_id,
                         authorization.cue_id,
                         CueQueueDisposition.COALESCED,
                     )
 
+                for pending in self._pending:
+                    if self._same_cue(pending.authorization, authorization):
+                        pending.authorization = authorization
+                        pending.queued_at = now
+                        self._coalesced_count += 1
+                        return CueEnqueueResult(
+                            pending.ticket_id,
+                            authorization.cue_id,
+                            CueQueueDisposition.COALESCED,
+                        )
+
+            # Generic count cues retain latest-value semantics. Scripted rep
+            # cues are classified as SCRIPT first, so One/Slower/Three stay
+            # strict FIFO and can never supersede one another.
             if lane is _CueLane.COUNT:
                 for pending in self._pending:
                     if pending.lane is _CueLane.COUNT:
@@ -420,8 +457,10 @@ class RealtimeCueDelivery:
                 elif event.kind is ServerEventKind.RESPONSE_DONE:
                     if response_id is None or event.response_id != response_id:
                         return False
-                    mode_is_active = self._current_mode() is SessionMode.ACTIVE_EXERCISE
-                    if not mode_is_active:
+                    mode_is_allowed = self._authorization_allowed_in_current_mode(
+                        active.authorization
+                    )
+                    if not mode_is_allowed:
                         failure = self._fail_active_locked(
                             CueDeliveryFailureReason.MODE_CHANGED,
                             terminal=True,
@@ -468,7 +507,7 @@ class RealtimeCueDelivery:
                             to_request = self._select_next_locked(self._now())
                     consumed = True
                 elif response_id is not None and event.response_id == response_id:
-                    if self._current_mode() is not SessionMode.ACTIVE_EXERCISE:
+                    if not self._authorization_allowed_in_current_mode(active.authorization):
                         cancel_for_mode = (active, response_id)
                         failure = self._fail_active_locked(
                             CueDeliveryFailureReason.MODE_CHANGED,
@@ -493,10 +532,12 @@ class RealtimeCueDelivery:
         return consumed
 
     def expire_stale(self) -> int:
-        """Drop stale queued work and cancel an over-time active response.
+        """Drop stale generic work and cancel an over-time active response.
 
         The application should call this from its existing device-loop tick;
-        this component intentionally creates no background thread.
+        this component intentionally creates no background thread.  Ordered
+        SCRIPT work has no queue-age expiry: it advances behind successful
+        responses or is cleared by a fail-closed session boundary.
         """
 
         now = self._now()
@@ -588,7 +629,7 @@ class RealtimeCueDelivery:
             )
 
     def _request_work(self, work: _CueWork) -> None:
-        if self._current_mode() is not SessionMode.ACTIVE_EXERCISE:
+        if not self._authorization_allowed_in_current_mode(work.authorization):
             with self._lock:
                 if self._active is work:
                     failure = self._fail_active_locked(
@@ -600,7 +641,7 @@ class RealtimeCueDelivery:
                     failure = None
             if failure is not None:
                 self._notify_failure(failure)
-            raise CueDeliveryError("prompt cues require ACTIVE_EXERCISE mode")
+            raise CueDeliveryError(self._mode_error_message())
 
         try:
             self._session.request_approved_prompt_cue(work.authorization)
@@ -717,6 +758,9 @@ class RealtimeCueDelivery:
     def _drop_stale_pending_locked(self, now: float) -> None:
         retained: list[_CueWork] = []
         for work in self._pending:
+            if work.lane is _CueLane.SCRIPT:
+                retained.append(work)
+                continue
             if now - work.queued_at > self._max_queue_age(work.lane):
                 self._stale_drop_count += 1
             else:
@@ -729,6 +773,8 @@ class RealtimeCueDelivery:
     def _lane_for(self, authorization: ApprovedCuePlaybackAuthorization) -> _CueLane:
         if authorization.cue_kind is CueKind.SAFETY:
             return _CueLane.SAFETY
+        if authorization.cue_id.value in self._ordered_cue_ids:
+            return _CueLane.SCRIPT
         if authorization.cue_id.value in self._count_cue_ids:
             return _CueLane.COUNT
         if authorization.cue_kind is CueKind.CORRECTION:
@@ -769,9 +815,28 @@ class RealtimeCueDelivery:
         self._next_ticket_id += 1
         return ticket_id
 
-    def _require_active_exercise(self) -> None:
-        if self._current_mode() is not SessionMode.ACTIVE_EXERCISE:
-            raise CueDeliveryError("prompt cues require ACTIVE_EXERCISE mode")
+    def _require_allowed_mode(
+        self,
+        authorization: ApprovedCuePlaybackAuthorization,
+    ) -> None:
+        if not self._authorization_allowed_in_current_mode(authorization):
+            raise CueDeliveryError(self._mode_error_message())
+
+    def _authorization_allowed_in_current_mode(
+        self,
+        authorization: ApprovedCuePlaybackAuthorization,
+    ) -> bool:
+        mode = self._current_mode()
+        if mode not in self._allowed_modes:
+            return False
+        if mode is SessionMode.CHECK_IN:
+            return authorization.cue_id.value in self._check_in_cue_ids
+        return mode is SessionMode.ACTIVE_EXERCISE
+
+    def _mode_error_message(self) -> str:
+        if self._allowed_modes == frozenset({SessionMode.ACTIVE_EXERCISE}):
+            return "prompt cues require ACTIVE_EXERCISE mode"
+        return "prompt cues require an allowed session mode"
 
     def _current_mode(self) -> SessionMode:
         mode = self._mode_provider.current_mode

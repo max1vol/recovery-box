@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 
 import pytest
 
@@ -86,7 +87,7 @@ def test_pain_stops_and_model_cannot_reduce_action(guardian: Guardian, plan: Exe
     decision = guardian.decide(
         observation(pain_reported=True),
         plan,
-        LearnedSuggestion(GuardianAction.CUE, CueId.MOVE_SLOWLY),
+        LearnedSuggestion(GuardianAction.CONTINUE),
     )
 
     assert decision.action is GuardianAction.STOP
@@ -199,12 +200,12 @@ def test_approved_and_plan_allowed_cue_is_returned(guardian: Guardian, plan: Exe
     decision = guardian.decide(
         observation(),
         plan,
-        LearnedSuggestion(GuardianAction.CUE, CueId.KNEE_ALIGNMENT),
+        local_cue_request=LocalCueRequest(CueId.KNEE_ALIGNMENT),
     )
 
     assert decision.action is GuardianAction.CUE
     assert decision.cue_id == CueId.KNEE_ALIGNMENT
-    assert decision.reason_codes == (GuardianReason.LEARNED_MODEL_CUE_ACCEPTED,)
+    assert decision.reason_codes == (GuardianReason.LOCAL_CUE_ACCEPTED,)
     assert guardian.cue_catalog[decision.cue_id].spoken_text
 
 
@@ -275,38 +276,6 @@ def test_local_and_learned_cue_inputs_cannot_be_mixed(
         )
 
 
-def test_unknown_cue_pauses_instead_of_speaking(guardian: Guardian, plan: ExercisePlan) -> None:
-    decision = guardian.decide(
-        observation(),
-        plan,
-        LearnedSuggestion(GuardianAction.CUE, "invented-correction"),
-    )
-
-    assert decision.action is GuardianAction.PAUSE
-    assert decision.cue_id is None
-    assert decision.reason_codes == (
-        GuardianReason.UNKNOWN_CUE,
-        GuardianReason.LEARNED_MODEL_INCREASED_CAUTION,
-    )
-
-
-def test_catalog_cue_not_allowed_by_exercise_plan_pauses(
-    guardian: Guardian, plan: ExercisePlan
-) -> None:
-    decision = guardian.decide(
-        observation(),
-        plan,
-        LearnedSuggestion(GuardianAction.CUE, CueId.HOLD_POSITION),
-    )
-
-    assert decision.action is GuardianAction.PAUSE
-    assert decision.cue_id is None
-    assert decision.reason_codes == (
-        GuardianReason.CUE_NOT_ALLOWED,
-        GuardianReason.LEARNED_MODEL_INCREASED_CAUTION,
-    )
-
-
 @pytest.mark.parametrize(
     "suggested_action",
     (GuardianAction.PAUSE, GuardianAction.STOP, GuardianAction.ESCALATE),
@@ -319,6 +288,7 @@ def test_model_can_increase_caution(
     decision = guardian.decide(observation(), plan, LearnedSuggestion(suggested_action))
 
     assert decision.action is suggested_action
+    assert decision.cue_id is None
     assert GuardianReason.LEARNED_MODEL_INCREASED_CAUTION in decision.reason_codes
 
 
@@ -348,7 +318,7 @@ def test_custom_catalog_is_enforced() -> None:
     decision = guardian.decide(
         observation(exercise_id="exercise"),
         plan,
-        LearnedSuggestion(GuardianAction.CUE, "custom"),
+        local_cue_request=LocalCueRequest("custom"),
     )
 
     assert decision.action is GuardianAction.CUE
@@ -408,9 +378,9 @@ def test_plan_normalizes_cue_ids_and_rejects_invalid_limits() -> None:
 def test_suggestion_and_decision_enforce_cue_invariants() -> None:
     with pytest.raises(ValueError, match="must not be empty"):
         LocalCueRequest(" ")
-    with pytest.raises(ValueError, match="requires cue_id"):
+    with pytest.raises(ValueError, match="cannot select cues"):
         LearnedSuggestion(GuardianAction.CUE)
-    with pytest.raises(ValueError, match="only valid"):
+    with pytest.raises(ValueError, match="cannot include cue_id"):
         LearnedSuggestion(GuardianAction.STOP, "cue")
     with pytest.raises(ValueError, match="requires cue_id"):
         GuardianDecision(
@@ -431,3 +401,66 @@ def test_suggestion_and_decision_enforce_cue_invariants() -> None:
 def test_default_catalog_contains_unique_nonempty_fixed_phrases() -> None:
     assert set(DEFAULT_CUE_CATALOG) == {cue.value for cue in CueId}
     assert all(cue.spoken_text.strip() for cue in DEFAULT_CUE_CATALOG.values())
+
+
+def test_default_catalog_content_digest_is_reviewed() -> None:
+    assert (
+        DEFAULT_CUE_CATALOG.content_sha256
+        == "14a8cd4c39130787172a0bc49a8408c48a13e6ae0335e48b43e3f8fd4b23e183"
+    )
+
+
+def test_three_squat_script_phrases_are_exact_reviewed_catalog_entries() -> None:
+    assert DEFAULT_CUE_CATALOG[CueId.SQUAT_SET_INTRO].spoken_text == (
+        "Hi Max. Let's start with a set of three squats."
+    )
+    assert DEFAULT_CUE_CATALOG[CueId.SQUAT_PERSON_DETECTED].spoken_text == (
+        "I can see you. Now do the squats."
+    )
+    assert DEFAULT_CUE_CATALOG[CueId.SQUAT_REP_ONE].spoken_text == "One."
+    assert DEFAULT_CUE_CATALOG[CueId.SQUAT_REP_TWO].spoken_text == "Slower."
+    assert DEFAULT_CUE_CATALOG[CueId.SQUAT_REP_THREE].spoken_text == (
+        "Three. Excellent. Now bring your arms out into a T shape."
+    )
+
+
+def test_guardian_scripted_session_path_is_closed_and_plan_scoped(
+    guardian: Guardian,
+) -> None:
+    script_plan = ExercisePlan(
+        exercise_id="squat",
+        allowed_cue_ids=frozenset(
+            {
+                CueId.SQUAT_SET_INTRO,
+                CueId.SQUAT_PERSON_DETECTED,
+            }
+        ),
+        required_camera_views=1,
+    )
+
+    intro = guardian.decide_scripted_session_cue(
+        LocalCueRequest(CueId.SQUAT_SET_INTRO),
+        script_plan,
+    )
+    unknown = guardian.decide_scripted_session_cue(
+        LocalCueRequest("not-reviewed"),
+        script_plan,
+    )
+    wrong_stage = guardian.decide_scripted_session_cue(
+        LocalCueRequest(CueId.SQUAT_REP_ONE),
+        replace(script_plan, allowed_cue_ids=frozenset({CueId.SQUAT_REP_ONE})),
+    )
+    plan_disallowed = guardian.decide_scripted_session_cue(
+        LocalCueRequest(CueId.SQUAT_PERSON_DETECTED),
+        replace(script_plan, allowed_cue_ids=frozenset({CueId.SQUAT_SET_INTRO})),
+    )
+
+    assert intro.action is GuardianAction.CUE
+    assert intro.cue_id == CueId.SQUAT_SET_INTRO
+    assert intro.reason_codes == (GuardianReason.LOCAL_CUE_ACCEPTED,)
+    assert unknown.action is GuardianAction.PAUSE
+    assert unknown.reason_codes == (GuardianReason.UNKNOWN_CUE,)
+    assert wrong_stage.action is GuardianAction.PAUSE
+    assert wrong_stage.reason_codes == (GuardianReason.CUE_NOT_ALLOWED,)
+    assert plan_disallowed.action is GuardianAction.PAUSE
+    assert plan_disallowed.reason_codes == (GuardianReason.CUE_NOT_ALLOWED,)

@@ -41,11 +41,13 @@ write directly to GPIO/audio/model storage.
 ## Laptop squat boundary
 
 The runnable laptop demo is a single-camera, image-plane tracker. It uses the
-`x` and `y` projection of MediaPipe landmarks to recognize a configured
-standing-down-standing sequence and sustained arms-in-T condition. It does not
-measure depth, anatomical 3D joint angles, force, load, balance, pain, or
-cross-camera agreement. It is not equivalent to the target dual-view Pi
-architecture or to clinical motion capture.
+`x` and `y` projection of MediaPipe landmarks to recognize three configured
+standing-down-standing cycles. The third fixed cue then instructs the person to
+bring their arms into a T shape; the script does not require the arms to remain
+in that shape throughout the squats. It does not measure depth, anatomical 3D
+joint angles, force, load, balance, pain, or cross-camera agreement. It is not
+equivalent to the target dual-view Pi architecture or to clinical motion
+capture.
 
 Perspective, camera placement, self-occlusion, clothing, lighting, and
 out-of-frame landmarks can affect projected angles. Low visibility, low
@@ -65,7 +67,8 @@ isolated response on that same socket, while normal active-exercise speech
 remains blocked. The semantic end boundary is physical stop or locally
 validated `finish_session` only. OpenAI documents a 60-minute maximum Realtime
 session, so this unrotated hackathon composition is limited to a shorter
-workout. Connection rotation has not been implemented or accepted.
+workout. Completing the third rep and issuing the T-shape instruction leaves
+that session open. Connection rotation has not been implemented or accepted.
 
 ## Privacy invariants
 
@@ -112,8 +115,9 @@ workout. Connection rotation has not been implemented or accepted.
   the exact Guardian-selected prompt phrase.
 - Confirm a canceled response arriving late cannot open the following turn's
   speaker authorization.
-- Confirm ten completed squats do not close the shared Realtime session, while
-  physical stop and one locally validated empty `finish_session` call each do.
+- Confirm three completed squats and the final T-shape cue do not close the
+  shared Realtime session, while physical stop and one locally validated empty
+  `finish_session` call each do.
 - Confirm the live workout stays below the documented 60-minute session cap.
 - Do not show a Flower round as part of the live camera loop; snapshot only
   sanitized numeric data after session end and preserve the current exercise
@@ -122,9 +126,9 @@ workout. Connection rotation has not been implemented or accepted.
 
 ## Current Realtime acceptance evidence
 
-The named verifier simulates rep one, rep two, and arms leaving the T shape
-through the real Guardian, then attempts three prompt cues on one live Realtime
-connection:
+The named verifier simulates all five closed stages—introduction, first
+assessable standing detection, and completed reps one through three—through the
+real Guardian, then attempts five prompt cues on one live Realtime connection:
 
 ```bash
 uv run recoverybox verify-realtime-cues \
@@ -133,12 +137,11 @@ uv run recoverybox verify-realtime-cues \
   --asr-model whisper-1
 ```
 
-The accepted live run reused one `gpt-realtime-2.1` connection with voice
-`marin`. All three responses cleared the exact Realtime transcript gate and
-independent timestamped `whisper-1` ASR; safe release occurred 502 ms, 547 ms,
-and 740 ms after the respective requests. The local ignored report omits
-provider response IDs, transcripts, ASR word text, and credentials; it retains
-only content-free match/timing evidence and paths to audio that already passed
-the exact-transcript gate. These simulated events accept the Realtime
-cue/gate/ASR lane, not webcam pose accuracy, actual speaker onset, or complete
+On 2026-08-25 the current five-cue catalog passed 5/5 live completed-transcript
+gates on one `gpt-realtime-2.1` connection. The run used `--skip-asr`, so no
+independent ASR claim is made. The local ignored report omits provider response
+IDs, transcripts, prompt text, ASR word text, and credentials; it retains only
+content-free event names, match/timing evidence, and paths to audio that already
+passed the exact-transcript gate. This accepts the simulated Realtime cue/gate
+lane, not webcam pose accuracy, actual speaker onset, or complete
 camera-to-speaker latency.

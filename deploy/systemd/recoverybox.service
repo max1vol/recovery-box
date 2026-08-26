@@ -1,0 +1,61 @@
+[Unit]
+Description=RecoveryBox deterministic Guardian
+After=network-online.target tailscaled.service
+Wants=network-online.target
+RequiresMountsFor=/opt/recoverybox /etc/recoverybox
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+SupplementaryGroups=gpio video
+WorkingDirectory=/opt/recoverybox/app
+EnvironmentFile=/etc/recoverybox/recoverybox.env
+Environment=PYTHONPATH=/opt/recoverybox/app/src
+Environment=PYTHONDONTWRITEBYTECODE=1
+# systemd copies this root-only source into a service-private, read-only
+# credential directory. The secret never enters the process environment.
+LoadCredential=openai-api-key:/etc/recoverybox/credentials/openai-api-key
+Environment=RECOVERYBOX_OPENAI_CREDENTIAL_FILE=%d/openai-api-key
+ExecStart=/usr/bin/python3 -m recoverybox.device.remote_pose_service
+ExecStopPost=-/usr/bin/rm -f /run/recoverybox/status.json
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=5
+UMask=0077
+LimitCORE=0
+RuntimeDirectory=recoverybox
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=restart
+
+# The service is silent by configuration, and the kernel device policy also
+# makes every ALSA device inaccessible if that configuration ever regresses.
+# Local pose owns only the pinned camera and GPIO devices in this process.
+DevicePolicy=closed
+DeviceAllow=/dev/gpiochip0 rw
+DeviceAllow=/dev/video0 rw
+
+NoNewPrivileges=true
+CapabilityBoundingSet=
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/opt/recoverybox/app /opt/recoverybox/runtime /opt/recoverybox/models
+ReadWritePaths=/run/recoverybox
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+# CapabilityBoundingSet is empty, so the process cannot alter the system
+# clock. Avoid ProtectClock here because systemd otherwise adds an implicit
+# read-only char-rtc DeviceAllow, widening the reviewed camera/GPIO device set.
+ProtectHostname=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=100.64.0.0/10
+
+[Install]
+WantedBy=multi-user.target

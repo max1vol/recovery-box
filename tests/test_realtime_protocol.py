@@ -192,11 +192,11 @@ def _prompt_cue_authorization(
         cue_kind=cue.kind if cue_kind is None else cue_kind,
         catalog_version=catalog_version,
         guardian_rule_version="guardian-test-v1",
-        reason_codes=(GuardianReason.LEARNED_MODEL_CUE_ACCEPTED,),
+        reason_codes=(GuardianReason.LOCAL_CUE_ACCEPTED,),
     )
 
 
-def test_session_update_pins_model_pcm_and_manual_turns() -> None:
+def test_session_update_keeps_model_on_url_and_pins_pcm_manual_turns() -> None:
     tool = _registry().wire_tools[0]
     event = build_session_update(
         instructions="Keep the check-in concise.",
@@ -207,7 +207,9 @@ def test_session_update_pins_model_pcm_and_manual_turns() -> None:
     session = event["session"]
     assert REALTIME_MODEL == "gpt-realtime-2.1"
     assert REALTIME_WEBSOCKET_URL.endswith("model=gpt-realtime-2.1")
-    assert session["model"] == "gpt-realtime-2.1"
+    # The model is selected when the WebSocket is opened and is immutable in
+    # session.update. Sending it here is rejected by the GA Realtime API.
+    assert "model" not in session
     assert session["output_modalities"] == ["audio"]
     assert session["audio"]["input"] == {
         "format": {"type": "audio/pcm", "rate": 24_000},
@@ -324,7 +326,7 @@ def test_active_prompt_cue_quarantine_releases_only_after_exact_transcript() -> 
     assert (
         gate.ingest_raw(
             _transcript_done(
-                f"  {cue.spoken_text}\n",
+                cue.spoken_text,
                 event_id="evt-prompt-transcript-done",
             )
         )
@@ -448,6 +450,9 @@ def test_active_prompt_cue_quarantine_discards_incomplete_content(missing: str) 
 @pytest.mark.parametrize(
     "near_match",
     (
+        " Move slowly and with control.",
+        "Move  slowly and with control.",
+        "Move slowly and with control.\n",
         "move slowly and with control.",
         "Move slowly and with control!",
         "Move very slowly and with control.",
@@ -488,7 +493,7 @@ def test_strict_quarantine_is_complete_and_exact_before_release() -> None:
     assert gate.quarantined_audio_bytes == len(PCM_A + PCM_B)
     assert gate.ingest_raw(_audio_done()) == ()
 
-    released = gate.ingest_raw(_transcript_done("  You're   ready for today.\n"))
+    released = gate.ingest_raw(_transcript_done("You're ready for today."))
     assert len(released) == 1
     assert released[0].pcm16_mono_24khz == PCM_A + PCM_B
     assert released[0].complete is True
@@ -746,10 +751,40 @@ def test_prompt_cue_request_rejects_catalog_kind_mismatch() -> None:
     assert session.audio_gate.open_authorizations == 0
 
 
-def test_normalization_changes_only_unicode_composition_and_whitespace() -> None:
-    assert normalize_authorized_text(" Cafe\u0301\n  ready. ") == "Café ready."
-    assert normalize_authorized_text("Ready!") != normalize_authorized_text("ready.")
-    assert normalize_authorized_text("'Ready'") != normalize_authorized_text("“Ready”")
+def test_authorized_text_compatibility_helper_preserves_every_code_point() -> None:
+    text = " Cafe\u0301\n  ready. "
+    assert normalize_authorized_text(text) == text
+    assert normalize_authorized_text("Cafe\u0301") != normalize_authorized_text("Café")
+
+
+@pytest.mark.parametrize(
+    ("authorized", "transcript"),
+    (
+        ("Café.", "Cafe\u0301."),
+        ("Move slowly.", " Move slowly."),
+        ("Move slowly.", "Move  slowly."),
+        ("Move slowly.", "Move slowly.\n"),
+        ("Move slowly.", "move slowly."),
+        ("Move slowly.", "Move slowly!"),
+    ),
+)
+def test_quarantine_rejects_every_nonliteral_transcript(
+    authorized: str,
+    transcript: str,
+) -> None:
+    gate = ModelAudioGate()
+    gate.authorize_next_response(
+        mode=ConversationMode.ACTIVE_EXERCISE,
+        policy=ModelAudioPolicy.PROMPT_CUE_QUARANTINE,
+        authorized_text=authorized,
+    )
+    gate.ingest_raw(_created())
+    gate.ingest_raw(_audio())
+    gate.ingest_raw(_audio_done())
+
+    assert gate.ingest_raw(_transcript_done(transcript)) == ()
+    assert gate.ingest_raw(_response_done()) == ()
+    assert gate.blocked_audio_bytes == len(PCM_A)
 
 
 def test_tool_calls_are_exposed_only_after_local_schema_validation() -> None:

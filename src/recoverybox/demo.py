@@ -11,6 +11,7 @@ from recoverybox.core import (
     Guardian,
     GuardianAction,
     LearnedSuggestion,
+    LocalCueRequest,
     MovementObservation,
     SessionMode,
 )
@@ -97,7 +98,7 @@ def run_safety_demo() -> list[DemoEvent]:
     correction = guardian.decide(
         _observation(first.fused, timestamp_ms=1_100),
         plan,
-        LearnedSuggestion(GuardianAction.CUE, CueId.MOVE_SLOWLY),
+        local_cue_request=LocalCueRequest(CueId.MOVE_SLOWLY),
     )
     correction_effect = coordinator.apply_guardian_decision(correction)
     assert correction_effect.cue_authorization is not None

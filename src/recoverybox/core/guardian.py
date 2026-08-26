@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from recoverybox.core.cues import DEFAULT_CUE_CATALOG, ApprovedCueCatalog
+from recoverybox.core.cues import (
+    DEFAULT_CUE_CATALOG,
+    SQUAT_SCRIPTED_SESSION_CUE_IDS,
+    ApprovedCueCatalog,
+)
 from recoverybox.core.models import (
     ExercisePlan,
     GuardianAction,
@@ -73,7 +77,6 @@ class Guardian:
             action, cue_id = self._apply_learned_suggestion(
                 action,
                 learned_suggestion,
-                plan,
                 reasons,
             )
 
@@ -84,6 +87,44 @@ class Guardian:
             action=action,
             cue_id=cue_id,
             reason_codes=tuple(reasons),
+            rule_version=self._rule_version,
+        )
+
+    def decide_scripted_session_cue(
+        self,
+        request: LocalCueRequest,
+        plan: ExercisePlan,
+    ) -> GuardianDecision:
+        """Authorize one closed, observation-free session-stage cue.
+
+        This path exists only for the welcome and first-person-detected stages,
+        where an exercise observation either does not exist yet or has already
+        been validated separately.  It cannot authorize rep, correction,
+        safety, or model-selected speech.
+        """
+
+        if not isinstance(request, LocalCueRequest):
+            raise TypeError("request must be a LocalCueRequest")
+        if not isinstance(plan, ExercisePlan):
+            raise TypeError("plan must be an ExercisePlan")
+
+        cue_id = request.cue_id
+        if not self._cue_catalog.is_approved(cue_id):
+            return GuardianDecision(
+                action=GuardianAction.PAUSE,
+                reason_codes=(GuardianReason.UNKNOWN_CUE,),
+                rule_version=self._rule_version,
+            )
+        if cue_id not in SQUAT_SCRIPTED_SESSION_CUE_IDS or cue_id not in plan.allowed_cue_ids:
+            return GuardianDecision(
+                action=GuardianAction.PAUSE,
+                reason_codes=(GuardianReason.CUE_NOT_ALLOWED,),
+                rule_version=self._rule_version,
+            )
+        return GuardianDecision(
+            action=GuardianAction.CUE,
+            cue_id=cue_id,
+            reason_codes=(GuardianReason.LOCAL_CUE_ACCEPTED,),
             rule_version=self._rule_version,
         )
 
@@ -147,22 +188,14 @@ class Guardian:
         self,
         deterministic_action: GuardianAction,
         suggestion: LearnedSuggestion,
-        plan: ExercisePlan,
         reasons: list[GuardianReason],
     ) -> tuple[GuardianAction, str | None]:
         proposed_action = suggestion.action
 
+        # LearnedSuggestion rejects CUE at construction. Keep this branch as a
+        # fail-closed defense against a forged or deserialized instance.
         if proposed_action is GuardianAction.CUE:
-            assert suggestion.cue_id is not None
-            if not self._cue_catalog.is_approved(suggestion.cue_id):
-                proposed_action = GuardianAction.PAUSE
-                reasons.append(GuardianReason.UNKNOWN_CUE)
-            elif suggestion.cue_id not in plan.allowed_cue_ids:
-                proposed_action = GuardianAction.PAUSE
-                reasons.append(GuardianReason.CUE_NOT_ALLOWED)
-            elif _ACTION_CAUTION[deterministic_action] < _ACTION_CAUTION[GuardianAction.PAUSE]:
-                reasons.append(GuardianReason.LEARNED_MODEL_CUE_ACCEPTED)
-                return GuardianAction.CUE, suggestion.cue_id
+            proposed_action = GuardianAction.PAUSE
 
         deterministic_caution = _ACTION_CAUTION[deterministic_action]
         proposed_caution = _ACTION_CAUTION[proposed_action]

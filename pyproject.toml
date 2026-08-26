@@ -34,6 +34,8 @@ dev = [
 
 [project.scripts]
 recoverybox = "recoverybox.cli:main"
+recoverybox-pose-client = "recoverybox.laptop.pose_client:main"
+recoverybox-local-prime = "recoverybox.laptop.local_prime:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/recoverybox"]

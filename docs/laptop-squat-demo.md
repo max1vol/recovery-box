@@ -1,10 +1,11 @@
 # Laptop squat demo
 
-The runnable hackathon slice is a ten-repetition squat session on a macOS
-laptop. One webcam is processed locally, deterministic code decides whether a
-frame is assessable and whether a repetition completed, the Guardian selects
-only reviewed cue IDs, and `gpt-realtime-2.1` voices the corresponding fixed
-phrases. This is a narrow interaction demo, not a clinical assessment.
+The runnable hackathon slice is a deterministic three-squat session on a macOS
+laptop, followed by a T-shape instruction. One webcam is processed locally,
+deterministic code decides whether a frame is assessable and whether a
+repetition completed, the Guardian selects only reviewed cue IDs, and
+`gpt-realtime-2.1` voices the corresponding fixed phrases. This is a narrow
+interaction demo, not a clinical assessment.
 
 ## Install exactly the laptop stack
 
@@ -73,6 +74,11 @@ The preview and terminal controls are deliberately small:
 - `r` plus Enter requests an explicit resume, which succeeds only from a fresh,
   assessable standing pose.
 
+The preview is enabled by default. Alongside the mirrored camera, pose bones,
+keypoints, squat phase, count, mode, and controls, it shows camera-loop FPS and
+capture latency plus pose-model FPS and inference latency. Use `--no-preview`
+only when the native debug window is not wanted.
+
 `--no-voice` is an explicit camera/pose-only run. It opens no Realtime
 connection, disables microphone turns, and produces no exercise cues. It is
 useful for checking local tracking but is intentional silence, not a TTS
@@ -95,8 +101,9 @@ Client events use one bounded, ordered sender worker, so a slow socket write
 cannot block the camera/Guardian loop or a physical stop. Queue exhaustion or
 an asynchronous send failure permanently disables cloud coaching for that
 workout.
-Completing ten repetitions, pausing, silence, or an ordinary model response
-does not end the session. The two normal end capabilities are:
+Completing the three repetitions, issuing the final T-shape instruction,
+pausing, silence, or an ordinary model response does not end the session. The
+two normal end capabilities are:
 
 1. a local physical-stop action; or
 2. a `finish_session` tool call with an empty object that has passed the local
@@ -131,11 +138,32 @@ connected, installed runtime versions, and scrubbed failure class/reason fields.
 It does not print frames, landmarks, captured audio, transcripts, prompts, or a
 credential.
 
+## Fixed three-squat choreography
+
+The exercise script is local and deterministic; it is not improvised by the
+model:
+
+1. At session start, the Guardian authorizes “Hi Max. Let's start with a set of
+   three squats.”
+2. The camera loop waits for the first assessable standing pose. The Guardian
+   then authorizes “I can see you. Now do the squats.” exactly once. Rep
+   counting remains gated until that cue finishes speaker playback and a newer
+   assessable standing frame arrives, so movement during the prompt is ignored.
+3. The first completed standing-down-standing cycle authorizes “One.”
+4. The second completed cycle authorizes “Slower.”
+5. The third completed cycle authorizes “Three. Excellent. Now bring your arms
+   out into a T shape.”
+
+The final cue is an instruction, not a session-end signal. The shared Realtime
+connection and local workout state stay open until one of the two explicit end
+capabilities above is used.
+
 ## Live cue verification
 
-This separate command drives three simulated semantic events—rep one, rep two,
-and arms out of the T position—through the real Guardian, then requests their
-cues sequentially over one live Realtime socket:
+This separate command drives the complete five-stage script through the real
+Guardian boundaries: the two closed scripted-session authorizations and three
+assessable completed-rep authorizations. It requests their cues sequentially
+over one live Realtime socket:
 
 ```bash
 uv run recoverybox verify-realtime-cues \
@@ -149,26 +177,26 @@ On success the command writes those gate-released verification WAVs plus
 `artifacts/realtime-verification/report.json`, including response-stage timing
 and the optional post-gate ASR check. The persisted/stdout report keeps match
 booleans and word timing offsets, but omits provider response IDs, transcripts,
-and ASR word text. This verifies cue delivery; the three
-semantic events are simulated and do not prove webcam pose accuracy.
+prompt text, and ASR word text. Its event names come from a closed, content-free
+vocabulary. This verifies cue delivery; the five semantic events are simulated
+and do not prove webcam pose accuracy.
 
-Current sanitized result:
+Acceptance status for the current script:
 
 ```text
-exit code: 0
-model/voice: gpt-realtime-2.1 / marin
-exact Realtime transcript gate: 3/3 passed
-timestamped whisper-1 ASR: 3/3 passed
-safe playback release after request: 502 ms / 547 ms / 740 ms
-gate-released verification WAV files: 3
-report.json: produced locally under artifacts/realtime-verification/
+2026-08-25 model/voice: gpt-realtime-2.1 / marin
+exact completed-transcript gates: 5/5 passed
+quarantine release ms: 968.160, 941.650, 482.981, 503.155, 1042.839
+independent ASR: not run (--skip-asr); not claimed
+report: artifacts/realtime-verification-three-squat/report.json
 ```
 
 The report and WAVs are local ignored verification artifacts and are not part
 of the repository. No provider text, transcript, ASR word text, or credential
-fragment is retained in the report. This accepts the simulated-event Realtime
-cue/gate/ASR lane; it does not establish webcam pose accuracy, actual speaker
-onset, or end-to-end camera-to-speaker latency.
+fragment is retained in the report. The old three-cue result is historical;
+the current five-cue gate evidence is the run recorded above. It accepts only
+the simulated-event Realtime cue/gate lane—not independent ASR, webcam pose
+accuracy, actual speaker onset, or end-to-end camera-to-speaker latency.
 
 ## Single-camera and 2D limits
 

@@ -17,6 +17,10 @@ Guardian, macOS microphone/speaker adapters, and one persistent Realtime
 WebSocket. The model file and native Python dependency pins are documented in
 [the laptop runbook](laptop-squat-demo.md).
 
+The default native preview keeps frames process-local while drawing pose bones,
+keypoints, workout state, camera-loop FPS/capture latency, and pose-model
+FPS/inference latency for debugging.
+
 ```mermaid
 flowchart LR
     subgraph Laptop[macOS laptop workout]
@@ -113,8 +117,13 @@ turn.
 The laptop workout opens one WebSocket, sends one session configuration, and
 reuses that session for all manual input turns and prompt cues. Cue responses
 set `conversation: "none"` so they are isolated from conversational history,
-but they still travel over the same socket. A completed repetition, tenth rep,
-pause, silence, or ordinary response does not close it. Normal session end is
+but they still travel over the same socket. The deterministic script welcomes
+Max, waits for the first assessable standing pose before issuing one
+detection/start cue, waits for successful speaker playback plus a newer
+standing observation, then authorizes fixed cues for reps one, two, and three.
+The third cue includes the instruction to bring the arms into a T shape. A
+completed repetition, the completed three-rep set and final instruction, pause,
+silence, or ordinary response does not close the session. Normal session end is
 limited to a physical stop or a locally validated, argument-free
 `finish_session` tool call. Provider/transport failure may force cleanup, but
 is not treated as user intent to finish.
@@ -182,6 +191,13 @@ PCM until the completed transcript exactly matches. `PAUSE`, `STOP`, and
 `ESCALATE` are silent in this prototype and synchronously close model audio.
 The laptop composition connects this path to one macOS speaker arbiter; doing
 the same in the long-running Pi service remains part of its hardware slice.
+
+The welcome and first-person-detected/start phrases use a separate, closed
+Guardian scripted-session authorization available only around check-in. The
+first assessable standing observation is still validated deterministically
+before the one-time detection cue. Once active, reps one through three use the
+ordinary pose-derived Guardian cue boundary. Neither path accepts caller-supplied
+speech text.
 
 The same local end controller accepts exactly two typed capabilities: physical
 stop and a `finish_session` call already validated by the one-tool registry.

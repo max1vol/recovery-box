@@ -1,0 +1,48 @@
+[Unit]
+Description=RecoveryBox sanitized Tailnet status
+After=network-online.target tailscaled.service recoverybox.service
+Wants=network-online.target
+RequiresMountsFor=/opt/recoverybox /etc/recoverybox
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/opt/recoverybox/app
+EnvironmentFile=/etc/recoverybox/recoverybox.env
+Environment=PYTHONPATH=/opt/recoverybox/app/src
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 /opt/recoverybox/app/deploy/recoverybox_status.py
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=5
+UMask=0077
+
+# This process needs no hardware at all, including no camera, GPIO, or sound.
+DevicePolicy=closed
+NoNewPrivileges=true
+CapabilityBoundingSet=
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/opt/recoverybox/app /run/recoverybox
+# The status process receives only the sanitized status file. It cannot read
+# the pose protocol token even though both services intentionally run as pi.
+InaccessiblePaths=/etc/recoverybox/credentials
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+# CapabilityBoundingSet is empty, so the process cannot alter the system
+# clock. Avoid ProtectClock because systemd otherwise adds an implicit
+# read-only char-rtc DeviceAllow to this hardware-free service.
+ProtectHostname=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=100.64.0.0/10
+
+[Install]
+WantedBy=multi-user.target

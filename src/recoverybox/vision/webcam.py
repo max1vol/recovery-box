@@ -162,11 +162,13 @@ class WebcamPoseSource:
         config: WebcamPoseConfig,
         *,
         _clock_ns: Callable[[], int] = monotonic_ns,
+        _performance_clock_ns: Callable[[], int] = monotonic_ns,
     ) -> None:
         if not isinstance(config, WebcamPoseConfig):
             raise TypeError("config must be a WebcamPoseConfig")
         self.config = config
         self._clock_ns = _clock_ns
+        self._performance_clock_ns = _performance_clock_ns
         self._cv2: Any | None = None
         self._mediapipe: Any | None = None
         self._capture: Any | None = None
@@ -174,6 +176,7 @@ class WebcamPoseSource:
         self._last_timestamp_ms: int | None = None
         self._quit_requested = False
         self._preview_visible = False
+        self._last_frame_completed_ns: int | None = None
 
     @property
     def is_open(self) -> bool:
@@ -230,6 +233,7 @@ class WebcamPoseSource:
         self._last_timestamp_ms = None
         self._quit_requested = False
         self._preview_visible = False
+        self._last_frame_completed_ns = None
         return self
 
     def read(self, *, preview_lines: Sequence[str] = ()) -> WebcamPoseSample:
@@ -250,7 +254,9 @@ class WebcamPoseSource:
         assert cv2 is not None and mediapipe is not None
         assert capture is not None and landmarker is not None
 
+        capture_started_ns = self._performance_now_ns() if self.config.preview else None
         success, camera_frame = capture.read()
+        capture_completed_ns = self._performance_now_ns() if self.config.preview else None
         if not success or camera_frame is None:
             raise WebcamReadError("webcam did not return a frame")
         try:
@@ -273,7 +279,9 @@ class WebcamPoseSource:
             image_format=mediapipe.ImageFormat.SRGB,
             data=rgb_frame,
         )
+        inference_started_ns = self._performance_now_ns() if self.config.preview else None
         result = landmarker.detect_for_video(media_image, timestamp_ms)
+        inference_completed_ns = self._performance_now_ns() if self.config.preview else None
         pose = pose_frame_from_mediapipe_result(
             result,
             timestamp_ms=timestamp_ms,
@@ -283,8 +291,21 @@ class WebcamPoseSource:
 
         quit_requested = False
         if self.config.preview:
-            quit_requested = self._preview(camera_frame, pose, lines)
+            assert capture_started_ns is not None and capture_completed_ns is not None
+            assert inference_started_ns is not None and inference_completed_ns is not None
+            performance_lines = self._performance_preview_lines(
+                capture_started_ns=capture_started_ns,
+                capture_completed_ns=capture_completed_ns,
+                inference_started_ns=inference_started_ns,
+                inference_completed_ns=inference_completed_ns,
+            )
+            quit_requested = self._preview(
+                camera_frame,
+                pose,
+                (*lines, *performance_lines),
+            )
             self._quit_requested = quit_requested
+            self._last_frame_completed_ns = inference_completed_ns
 
         # camera_frame, rgb_frame, and media_image remain local variables and
         # are not stored on the source or included in the returned sample.
@@ -327,6 +348,7 @@ class WebcamPoseSource:
                 first_error = first_error or exc
 
         self._preview_visible = False
+        self._last_frame_completed_ns = None
         if first_error is not None:
             raise first_error
 
@@ -345,6 +367,36 @@ class WebcamPoseSource:
             candidate = self._last_timestamp_ms + 1
         self._last_timestamp_ms = candidate
         return candidate
+
+    def _performance_now_ns(self) -> int:
+        value = self._performance_clock_ns()
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise RuntimeError("monotonic performance clock returned an invalid value")
+        return value
+
+    def _performance_preview_lines(
+        self,
+        *,
+        capture_started_ns: int,
+        capture_completed_ns: int,
+        inference_started_ns: int,
+        inference_completed_ns: int,
+    ) -> tuple[str, str]:
+        capture_ns = _elapsed_ns(capture_started_ns, capture_completed_ns)
+        inference_ns = _elapsed_ns(inference_started_ns, inference_completed_ns)
+        frame_interval_ns = (
+            None
+            if self._last_frame_completed_ns is None
+            else _elapsed_ns(self._last_frame_completed_ns, inference_completed_ns)
+        )
+        return (
+            "Frames: "
+            f"{_fps_from_interval_ns(frame_interval_ns):.1f} FPS | "
+            f"capture {_milliseconds(capture_ns):.1f} ms",
+            "Pose model: "
+            f"{_fps_from_interval_ns(inference_ns):.1f} FPS | "
+            f"inference {_milliseconds(inference_ns):.1f} ms",
+        )
 
     def _preview(
         self,
@@ -402,6 +454,22 @@ def _validate_optional_dimension(value: int | None, field_name: str) -> None:
         return
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{field_name} must be a positive integer when provided")
+
+
+def _elapsed_ns(start_ns: int, end_ns: int) -> int:
+    if end_ns < start_ns:
+        raise RuntimeError("monotonic performance clock moved backwards")
+    return end_ns - start_ns
+
+
+def _fps_from_interval_ns(interval_ns: int | None) -> float:
+    if interval_ns is None or interval_ns == 0:
+        return 0.0
+    return 1_000_000_000.0 / interval_ns
+
+
+def _milliseconds(elapsed_ns: int) -> float:
+    return elapsed_ns / 1_000_000.0
 
 
 def _load_runtime_modules() -> tuple[Any, Any]:

@@ -258,6 +258,7 @@ def test_preview_stays_internal_and_q_requests_clean_shutdown(
     with WebcamPoseSource(
         WebcamPoseConfig(model_path, preview=True, mirror_preview=True),
         _clock_ns=lambda: 2_000_000_000,
+        _performance_clock_ns=iter((100_000_000, 105_000_000, 106_000_000, 126_000_000)).__next__,
     ) as source:
         sample = source.read(preview_lines=("Squats: 1", "Stand tall"))
         assert sample.quit_requested
@@ -269,9 +270,80 @@ def test_preview_stays_internal_and_q_requests_clean_shutdown(
     assert runtime.cv2.flip_calls == 1
     assert runtime.cv2.line_calls > 0
     assert runtime.cv2.circle_calls > 0
-    assert runtime.cv2.text_lines == ["Squats: 1", "Stand tall"]
+    assert runtime.cv2.text_lines == [
+        "Squats: 1",
+        "Stand tall",
+        "Frames: 0.0 FPS | capture 5.0 ms",
+        "Pose model: 50.0 FPS | inference 20.0 ms",
+    ]
     assert runtime.cv2.operations.index("flip") < runtime.cv2.operations.index("text")
     assert runtime.cv2.destroyed_windows == ["RecoveryBox squat tracker"]
+
+
+def test_preview_performance_metrics_are_finite_deterministic_and_reset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "pose_landmarker.task"
+    model_path.write_bytes(b"test placeholder")
+    runtime = FakeVisionRuntime(results=[fake_result(), fake_result(), fake_result()])
+    monkeypatch.setattr(webcam_module, "_load_runtime_modules", runtime.modules)
+    timestamps = iter((1_000_000_000, 1_001_000_000, 1_002_000_000))
+    performance_times = iter(
+        (
+            # First frame: a zero-duration model sample remains finite.
+            100_000_000,
+            105_000_000,
+            106_000_000,
+            106_000_000,
+            # Second frame: 25 FPS between completed frames, 50 FPS model.
+            120_000_000,
+            125_000_000,
+            126_000_000,
+            146_000_000,
+            # Reopened source: frame-rate history must start cleanly again.
+            200_000_000,
+            205_000_000,
+            206_000_000,
+            226_000_000,
+        )
+    )
+    source = WebcamPoseSource(
+        WebcamPoseConfig(model_path, preview=True),
+        _clock_ns=timestamps.__next__,
+        _performance_clock_ns=performance_times.__next__,
+    )
+
+    source.open()
+    first = source.read()
+    second = source.read()
+    source.close()
+    source.open()
+    reopened = source.read()
+    source.close()
+
+    assert runtime.cv2.text_lines == [
+        "Frames: 0.0 FPS | capture 5.0 ms",
+        "Pose model: 0.0 FPS | inference 0.0 ms",
+        "Frames: 25.0 FPS | capture 5.0 ms",
+        "Pose model: 50.0 FPS | inference 20.0 ms",
+        "Frames: 0.0 FPS | capture 5.0 ms",
+        "Pose model: 50.0 FPS | inference 20.0 ms",
+    ]
+    assert all(
+        "nan" not in line.lower() and "inf fps" not in line.lower() and "inf ms" not in line.lower()
+        for line in runtime.cv2.text_lines
+    )
+    assert webcam_output_field_names() == {"timestamp_ms", "pose", "quit_requested"}
+    for sample in (first, second, reopened):
+        assert set(sample.__dataclass_fields__) == {
+            "timestamp_ms",
+            "pose",
+            "quit_requested",
+        }
+        assert not hasattr(sample, "frame")
+        assert not hasattr(sample, "image")
+    assert not hasattr(source, "last_frame")
 
 
 def test_camera_open_and_read_failures_are_explicit(

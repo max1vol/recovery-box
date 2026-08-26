@@ -9,6 +9,8 @@ One :class:`~recoverybox.laptop.squat_session.LaptopSquatSession` owns one
 Realtime transport for the whole demo.  Its sole receiver runs beside the
 camera loop so Guardian-authorized cues never block pose processing.  A cloud
 failure pauses coaching but does not stop the deterministic squat tracker.
+When explicitly configured, the same loop may enqueue only the derived numeric
+``SquatAnalysis`` records to a RecoveryBox peer; camera frames stay local.
 """
 
 from __future__ import annotations
@@ -23,10 +25,11 @@ from dataclasses import dataclass
 from enum import StrEnum
 from importlib import metadata
 from pathlib import Path
+from time import monotonic_ns
 from typing import Protocol, TextIO
 
 from recoverybox.config import ConfigurationError, Settings
-from recoverybox.core import SessionMode
+from recoverybox.core import CueId, SessionMode
 from recoverybox.exercise import SquatAnalysis, SquatPhase, SquatTracker
 from recoverybox.realtime import (
     BoundedOrderedTransport,
@@ -35,6 +38,12 @@ from recoverybox.realtime import (
     SessionEndSignal,
     SessionEndSource,
     WebSocketJsonTransport,
+)
+from recoverybox.remote_pose import (
+    MAX_REMOTE_POSE_EVIDENCE_AGE_MS,
+    RemotePosePublisher,
+    RemotePoseRequest,
+    load_remote_pose_token,
 )
 from recoverybox.vision import WebcamPoseConfig, WebcamPoseSample, WebcamPoseSource
 
@@ -163,6 +172,37 @@ class _Microphone(Protocol):
     def abort(self) -> None: ...
 
 
+class _RemotePosePublisher(Protocol):
+    """Non-blocking numeric-pose edge owned by the laptop launcher."""
+
+    @property
+    def connected(self) -> bool: ...
+
+    @property
+    def failure_kind(self) -> str | None: ...
+
+    @property
+    def messages_sent(self) -> int: ...
+
+    def start(self) -> None: ...
+
+    def wait_for_request(
+        self, timeout_seconds: float | None = None
+    ) -> RemotePoseRequest | None: ...
+
+    def submit(
+        self,
+        analysis: SquatAnalysis,
+        *,
+        request: RemotePoseRequest,
+        evidence_age_ms: int,
+    ) -> None: ...
+
+    def request_resume(self) -> None: ...
+
+    def close(self) -> None: ...
+
+
 class TerminalCommandSource:
     """Poll newline-delimited terminal controls without blocking the camera."""
 
@@ -222,7 +262,9 @@ class SquatDemoConfig:
     voice_enabled: bool = True
     microphone_enabled: bool = True
     max_frames: int | None = None
-    target_reps: int = 10
+    target_reps: int = 3
+    pose_peer: str | None = None
+    pose_token_file: str | Path | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.camera_index, bool) or not isinstance(self.camera_index, int):
@@ -245,10 +287,33 @@ class SquatDemoConfig:
             raise ValueError("max_frames must be a positive integer when provided")
         if isinstance(self.target_reps, bool) or not isinstance(self.target_reps, int):
             raise TypeError("target_reps must be an integer")
-        if self.target_reps != 10:
-            raise ValueError("the reviewed laptop squat prompt catalog requires exactly 10 reps")
+        if self.target_reps != 3:
+            raise ValueError("the reviewed laptop squat script requires exactly 3 reps")
+        pose_peer = self.pose_peer
+        if pose_peer is not None:
+            if not isinstance(pose_peer, str):
+                raise TypeError("pose_peer must be a HOST:PORT string")
+            if not pose_peer.strip():
+                raise ValueError("pose_peer must be a non-blank HOST:PORT value")
+            pose_peer = pose_peer.strip()
+        pose_token_file = self.pose_token_file
+        if pose_token_file is not None:
+            if isinstance(pose_token_file, str):
+                pose_token_file = pose_token_file.strip()
+                if not pose_token_file:
+                    raise ValueError("pose_token_file must not be blank")
+            try:
+                pose_token_file = Path(pose_token_file).expanduser()
+            except TypeError as exc:
+                raise TypeError("pose_token_file must be a filesystem path") from exc
+            if not str(pose_token_file).strip():
+                raise ValueError("pose_token_file must not be blank")
+        if (pose_peer is None) != (pose_token_file is None):
+            raise ValueError("pose_peer and pose_token_file must be configured together")
         object.__setattr__(self, "model_asset_path", Path(self.model_asset_path).expanduser())
         object.__setattr__(self, "voice", self.voice.strip())
+        object.__setattr__(self, "pose_peer", pose_peer)
+        object.__setattr__(self, "pose_token_file", pose_token_file)
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,6 +332,10 @@ class SquatDemoResult:
     realtime_failure_kind: str | None
     microphone_failure_kind: str | None
     cue_failure_reason: str | None
+    remote_pose_enabled: bool
+    remote_pose_connected: bool
+    remote_pose_failure_kind: str | None
+    remote_pose_messages_sent: int
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -282,6 +351,10 @@ class SquatDemoResult:
             "realtime_failure_kind": self.realtime_failure_kind,
             "microphone_failure_kind": self.microphone_failure_kind,
             "cue_failure_reason": self.cue_failure_reason,
+            "remote_pose_enabled": self.remote_pose_enabled,
+            "remote_pose_connected": self.remote_pose_connected,
+            "remote_pose_failure_kind": self.remote_pose_failure_kind,
+            "remote_pose_messages_sent": self.remote_pose_messages_sent,
         }
 
 
@@ -293,6 +366,9 @@ TrackerFactory = Callable[[], _SquatTracker]
 AudioPlayerFactory = Callable[[], _AudioPlayer]
 MicrophoneFactory = Callable[[], _Microphone]
 CommandSourceFactory = Callable[[], SquatDemoCommandSource]
+RemotePosePublisherFactory = Callable[[str, bytes], _RemotePosePublisher]
+RemotePoseTokenLoader = Callable[[str | Path], bytes]
+MonotonicNanoseconds = Callable[[], int]
 
 
 def _default_transport_factory(*, api_key: str) -> RealtimeTransport:
@@ -314,6 +390,9 @@ class SquatDemoDependencies:
     audio_player_factory: AudioPlayerFactory = MacOSAudioPlayer
     microphone_factory: MicrophoneFactory = LaptopMicrophoneRecorder
     command_source_factory: CommandSourceFactory = TerminalCommandSource
+    remote_pose_publisher_factory: RemotePosePublisherFactory = RemotePosePublisher
+    remote_pose_token_loader: RemotePoseTokenLoader = load_remote_pose_token
+    monotonic_ns: MonotonicNanoseconds = monotonic_ns
 
 
 class _LocalOnlyTransport:
@@ -336,6 +415,141 @@ class _LocalOnlyTransport:
 
     def close(self) -> None:
         self.closed = True
+
+
+class _RemotePoseBridge:
+    """Contain every optional publisher failure outside the local safety loop."""
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        publisher: _RemotePosePublisher | None = None,
+        failure_kind: str | None = None,
+    ) -> None:
+        self.enabled = enabled
+        self._publisher = publisher
+        self._connected = False
+        self._failure_kind = failure_kind
+        self._messages_sent = 0
+
+    @property
+    def connected(self) -> bool:
+        self._observe_status()
+        return self._connected
+
+    @property
+    def failure_kind(self) -> str | None:
+        self._observe_status()
+        return self._failure_kind
+
+    @property
+    def messages_sent(self) -> int:
+        self._observe_status()
+        return self._messages_sent
+
+    def start(self) -> None:
+        publisher = self._publisher
+        if publisher is None:
+            return
+        try:
+            publisher.start()
+        except Exception as exc:
+            self._record_failure(type(exc).__name__)
+        self._observe_status()
+
+    def wait_for_request(self, timeout_seconds: float) -> RemotePoseRequest | None:
+        publisher = self._publisher
+        if publisher is None:
+            return None
+        try:
+            return publisher.wait_for_request(timeout_seconds)
+        except Exception as exc:
+            self._record_failure(type(exc).__name__)
+            self._observe_status()
+            return None
+
+    def submit(
+        self,
+        analysis: SquatAnalysis,
+        *,
+        request: RemotePoseRequest,
+        evidence_age_ms: int,
+    ) -> None:
+        publisher = self._publisher
+        if publisher is None:
+            return
+        try:
+            publisher.submit(
+                analysis,
+                request=request,
+                evidence_age_ms=evidence_age_ms,
+            )
+        except Exception as exc:
+            self._record_failure(type(exc).__name__)
+        self._observe_status()
+
+    def request_resume(self) -> None:
+        publisher = self._publisher
+        if publisher is None:
+            return
+        try:
+            publisher.request_resume()
+        except Exception as exc:
+            self._record_failure(type(exc).__name__)
+        self._observe_status()
+
+    def close(self) -> None:
+        publisher = self._publisher
+        if publisher is None:
+            return
+        # Capture the useful connected state and sent count before close tears
+        # down the socket.  The result describes whether this run connected,
+        # matching the existing voice_connected field.
+        self._observe_status()
+        try:
+            publisher.close()
+        except Exception as exc:
+            self._record_failure(type(exc).__name__)
+        self._observe_status()
+
+    def _observe_status(self) -> None:
+        publisher = self._publisher
+        if publisher is None:
+            return
+        try:
+            self._connected = self._connected or bool(publisher.connected)
+        except Exception as exc:
+            self._record_failure(type(exc).__name__)
+        try:
+            messages_sent = publisher.messages_sent
+            if (
+                not isinstance(messages_sent, bool)
+                and isinstance(messages_sent, int)
+                and messages_sent >= 0
+            ):
+                self._messages_sent = max(self._messages_sent, messages_sent)
+            else:
+                self._record_failure("InvalidRemotePoseStatus")
+        except Exception as exc:
+            self._record_failure(type(exc).__name__)
+        try:
+            failure_kind = publisher.failure_kind
+        except Exception as exc:
+            self._record_failure(type(exc).__name__)
+        else:
+            if failure_kind:
+                self._record_failure(
+                    failure_kind
+                    if isinstance(failure_kind, str)
+                    and failure_kind.isascii()
+                    and failure_kind.isidentifier()
+                    else "RemotePosePublisherError"
+                )
+
+    def _record_failure(self, failure_kind: str) -> None:
+        if self._failure_kind is None:
+            self._failure_kind = failure_kind
 
 
 class _CueSpeakerBridge:
@@ -363,7 +577,7 @@ class _CueSpeakerBridge:
         ticket = player.play(clip.pcm16_mono_24khz)
         threading.Thread(
             target=self._watch_ticket,
-            args=(ticket,),
+            args=(ticket, clip.authorization.cue_id),
             name=f"recoverybox-cue-playback-{clip.ticket_id}",
             daemon=True,
         ).start()
@@ -372,7 +586,7 @@ class _CueSpeakerBridge:
         if self.player is not None:
             self.player.stop()
 
-    def _watch_ticket(self, ticket: _PlaybackTicket) -> None:
+    def _watch_ticket(self, ticket: _PlaybackTicket, cue_id: CueId) -> None:
         try:
             ticket.result()
         except PlaybackCancelledError:
@@ -386,6 +600,24 @@ class _CueSpeakerBridge:
             session = self._session
             if session is None or session.ended:
                 return
+            try:
+                session.report_speaker_failure()
+            except Exception:
+                pass
+            return
+
+        if cue_id is not CueId.SQUAT_PERSON_DETECTED:
+            return
+        session = self._session
+        if session is None or session.ended:
+            return
+        try:
+            session.notify_cue_playback_succeeded(cue_id)
+        except Exception:
+            # Failure at this boundary cannot be allowed to arm exercise.
+            callback = self._failure_callback
+            if callback is not None:
+                callback("SpeakerPlaybackError")
             try:
                 session.report_speaker_failure()
             except Exception:
@@ -410,6 +642,8 @@ class LaptopSquatDemo:
         microphone: _Microphone | None = None,
         microphone_failure_kind: str | None = None,
         runtime_versions: Mapping[str, str] | None = None,
+        remote_pose: _RemotePoseBridge | None = None,
+        monotonic_ns_clock: MonotonicNanoseconds = monotonic_ns,
     ) -> None:
         self.config = config
         self.session = session
@@ -423,6 +657,10 @@ class LaptopSquatDemo:
         self._realtime_failure_kind = voice_failure_kind
         self._microphone_failure_kind = microphone_failure_kind
         self._runtime_versions = dict(runtime_versions or {})
+        self._remote_pose = remote_pose or _RemotePoseBridge(enabled=False)
+        if not callable(monotonic_ns_clock):
+            raise TypeError("monotonic_ns_clock must be callable")
+        self._monotonic_ns = monotonic_ns_clock
         self._receiver_stop = threading.Event()
         self._receiver_thread: threading.Thread | None = None
         self._receiver_lock = threading.Lock()
@@ -447,6 +685,7 @@ class LaptopSquatDemo:
         try:
             self.pose_source.open()
             opened = True
+            self._remote_pose.start()
             self._start_receiver()
             self._print_controls()
 
@@ -457,6 +696,14 @@ class LaptopSquatDemo:
                     break
                 if self.session.ended:
                     break
+
+                request: RemotePoseRequest | None = None
+                if self._remote_pose.enabled:
+                    # The Pi owns cadence and freshness.  A verified request
+                    # must arrive before this process acquires the next frame.
+                    request = self._remote_pose.wait_for_request(0.05)
+                    if request is None:
+                        continue
 
                 sample = self.pose_source.read(preview_lines=self._preview_lines())
                 frames_processed += 1
@@ -480,6 +727,14 @@ class LaptopSquatDemo:
                 if analysis.assessable:
                     assessable_frames += 1
                 self._last_analysis = analysis
+                if request is not None:
+                    # submit() is a non-blocking, bounded handoff of numeric
+                    # analysis only. Any remote failure stays outside Guardian.
+                    self._remote_pose.submit(
+                        analysis,
+                        request=request,
+                        evidence_age_ms=self._capture_to_submit_age_ms(sample.timestamp_ms),
+                    )
 
                 self._activate_or_resume(analysis)
                 if not self.session.ended:
@@ -519,7 +774,7 @@ class LaptopSquatDemo:
             frames_processed=frames_processed,
             pose_frames=pose_frames,
             assessable_frames=assessable_frames,
-            rep_count=self.tracker.rep_count,
+            rep_count=self.session.completed_rep_count,
             end_reason=end_reason,
             final_mode=self.session.coordinator.current_mode,
             voice_enabled=self.config.voice_enabled,
@@ -528,6 +783,10 @@ class LaptopSquatDemo:
             realtime_failure_kind=self.realtime_failure_kind,
             microphone_failure_kind=self._microphone_failure_kind,
             cue_failure_reason=cue_failure.reason.value if cue_failure is not None else None,
+            remote_pose_enabled=self._remote_pose.enabled,
+            remote_pose_connected=self._remote_pose.connected,
+            remote_pose_failure_kind=self._remote_pose.failure_kind,
+            remote_pose_messages_sent=self._remote_pose.messages_sent,
         )
 
     def _start_receiver(self) -> None:
@@ -560,6 +819,7 @@ class LaptopSquatDemo:
         self._sync_session_failure()
         for command in commands:
             if command is SquatDemoCommand.RESUME:
+                self._remote_pose.request_resume()
                 self._resume_requested = True
             elif command is SquatDemoCommand.TOGGLE_MICROPHONE:
                 self._toggle_microphone()
@@ -600,7 +860,7 @@ class LaptopSquatDemo:
 
     def _activate_or_resume(self, analysis: SquatAnalysis) -> None:
         mode = self.session.coordinator.current_mode
-        if mode is SessionMode.IDLE:
+        if mode in {SessionMode.IDLE, SessionMode.CHECK_IN}:
             if self.session.activate_exercise(analysis):
                 self._write("[exercise] active")
                 if self.config.voice_enabled and self.realtime_failure_kind is not None:
@@ -625,7 +885,7 @@ class LaptopSquatDemo:
 
     def _preview_lines(self) -> tuple[str, ...]:
         analysis = self._last_analysis
-        rep_count = self.tracker.rep_count
+        rep_count = self.session.completed_rep_count
         phase = analysis.phase.value if analysis is not None else SquatPhase.UNKNOWN.value
         arms = "unknown"
         if analysis is not None and analysis.arms_in_t is not None:
@@ -647,10 +907,34 @@ class LaptopSquatDemo:
             controls,
         )
 
+    def _capture_to_submit_age_ms(self, capture_timestamp_ms: int) -> int:
+        """Return a conservative rounded-up same-host evidence age.
+
+        A malformed or backwards clock becomes exactly the stale boundary so
+        the publisher withholds the response and the Pi request watchdog fails
+        closed. The Pi's measured request round trip remains authoritative.
+        """
+
+        try:
+            now_ns = self._monotonic_ns()
+        except Exception:
+            return MAX_REMOTE_POSE_EVIDENCE_AGE_MS
+        if isinstance(now_ns, bool) or not isinstance(now_ns, int) or now_ns < 0:
+            return MAX_REMOTE_POSE_EVIDENCE_AGE_MS
+        now_ceiling_ms = (now_ns + 999_999) // 1_000_000
+        if now_ceiling_ms < capture_timestamp_ms:
+            return MAX_REMOTE_POSE_EVIDENCE_AGE_MS
+        return min(
+            now_ceiling_ms - capture_timestamp_ms,
+            MAX_REMOTE_POSE_EVIDENCE_AGE_MS,
+        )
+
     def _report_progress(self, mode: SessionMode, analysis: SquatAnalysis) -> None:
-        if analysis.rep_count > self._last_reported_rep_count:
-            self._last_reported_rep_count = analysis.rep_count
-            self._write(f"[exercise] rep {analysis.rep_count}")
+        del analysis
+        rep_count = self.session.completed_rep_count
+        if rep_count > self._last_reported_rep_count:
+            self._last_reported_rep_count = rep_count
+            self._write(f"[exercise] rep {rep_count}")
         if mode is not self._last_reported_mode:
             self._last_reported_mode = mode
             self._write(f"[exercise] mode {mode.value}")
@@ -669,7 +953,10 @@ class LaptopSquatDemo:
             self._set_realtime_failure(failure_kind)
 
     def _print_controls(self) -> None:
-        self._write("[controls] q/Escape stops; Enter toggles push-to-talk; r+Enter resumes")
+        if self.config.microphone_enabled:
+            self._write("[controls] q/Escape stops; Enter toggles push-to-talk; r+Enter resumes")
+        else:
+            self._write("[controls] q/Escape stops; r+Enter resumes")
 
     def _request_physical_stop(self) -> SessionEndSignal | None:
         try:
@@ -685,6 +972,14 @@ class LaptopSquatDemo:
         print(message, file=self.output, flush=True)
 
     def _shutdown(self, *, opened: bool) -> None:
+        try:
+            self._shutdown_local(opened=opened)
+        finally:
+            # The publisher owns the remote STOP/control teardown.  It must be
+            # attempted even if an unrelated local cleanup edge misbehaves.
+            self._remote_pose.close()
+
+    def _shutdown_local(self, *, opened: bool) -> None:
         microphone = self.microphone
         if microphone is not None and microphone.active:
             try:
@@ -751,6 +1046,37 @@ def _optional_distribution_version(distribution: str) -> str:
         return "missing"
     except Exception:
         return "metadata_error"
+
+
+def _optional_environment_value(environment: Mapping[str, str], name: str) -> str | None:
+    value = environment.get(name)
+    if value is None:
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _build_remote_pose_bridge(
+    config: SquatDemoConfig,
+    dependencies: SquatDemoDependencies,
+) -> _RemotePoseBridge:
+    if config.pose_peer is None:
+        return _RemotePoseBridge(enabled=False)
+
+    # SquatDemoConfig enforces the pair.  Keep both assertions local so a
+    # future refactor cannot accidentally treat a missing credential as an
+    # anonymous publisher connection.
+    assert config.pose_token_file is not None
+    token = b""
+    try:
+        token = dependencies.remote_pose_token_loader(config.pose_token_file)
+        publisher = dependencies.remote_pose_publisher_factory(config.pose_peer, token)
+    except Exception as exc:
+        return _RemotePoseBridge(enabled=True, failure_kind=type(exc).__name__)
+    finally:
+        # Do not retain the loader's credential on the launcher or bridge.
+        token = b""
+    return _RemotePoseBridge(enabled=True, publisher=publisher)
 
 
 def build_squat_demo(
@@ -859,20 +1185,27 @@ def build_squat_demo(
             cue_delivery_enabled=False,
         )
 
-    demo = LaptopSquatDemo(
-        config=config,
-        session=session,
-        pose_source=pose_source,
-        tracker=tracker,
-        command_source=command_source,
-        output=output,
-        voice_connected=voice_connected,
-        voice_failure_kind=voice_failure_kind,
-        audio_player=player,
-        microphone=microphone,
-        microphone_failure_kind=microphone_failure_kind,
-        runtime_versions=runtime_versions,
-    )
+    remote_pose = _build_remote_pose_bridge(config, selected)
+    try:
+        demo = LaptopSquatDemo(
+            config=config,
+            session=session,
+            pose_source=pose_source,
+            tracker=tracker,
+            command_source=command_source,
+            output=output,
+            voice_connected=voice_connected,
+            voice_failure_kind=voice_failure_kind,
+            audio_player=player,
+            microphone=microphone,
+            microphone_failure_kind=microphone_failure_kind,
+            runtime_versions=runtime_versions,
+            remote_pose=remote_pose,
+            monotonic_ns_clock=selected.monotonic_ns,
+        )
+    except Exception:
+        remote_pose.close()
+        raise
     speaker.bind_failure_callback(demo._set_realtime_failure)
     return demo
 
@@ -888,6 +1221,8 @@ def run_squat_demo(
     no_voice: bool = False,
     no_mic: bool = False,
     max_frames: int | None = None,
+    pose_peer: str | None = None,
+    pose_token_file: str | Path | None = None,
     dependencies: SquatDemoDependencies | None = None,
 ) -> int:
     """CLI-safe entrypoint; diagnostics never include provider payloads."""
@@ -895,6 +1230,16 @@ def run_squat_demo(
     env = os.environ if environment is None else environment
     try:
         settings = Settings.from_environment(env)
+        resolved_pose_peer = (
+            _optional_environment_value(env, "RECOVERYBOX_POSE_PEER")
+            if pose_peer is None
+            else pose_peer
+        )
+        resolved_pose_token_file = (
+            _optional_environment_value(env, "RECOVERYBOX_POSE_TOKEN_FILE")
+            if pose_token_file is None
+            else pose_token_file
+        )
         config = SquatDemoConfig(
             model_asset_path=settings.pose.model_path if model_path is None else Path(model_path),
             camera_index=settings.pose.camera_index if camera_index is None else camera_index,
@@ -903,6 +1248,8 @@ def run_squat_demo(
             voice_enabled=not no_voice,
             microphone_enabled=not no_voice and not no_mic,
             max_frames=max_frames,
+            pose_peer=resolved_pose_peer,
+            pose_token_file=resolved_pose_token_file,
         )
         demo = build_squat_demo(
             config,

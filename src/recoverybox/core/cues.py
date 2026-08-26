@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -11,6 +13,8 @@ from types import MappingProxyType
 class CueId(StrEnum):
     """Stable identifiers for the default approved cue set."""
 
+    SQUAT_SET_INTRO = "squat_set_intro"
+    SQUAT_PERSON_DETECTED = "squat_person_detected"
     READY = "ready"
     MOVE_SLOWLY = "move_slowly"
     KNEE_ALIGNMENT = "knee_alignment"
@@ -85,9 +89,44 @@ class ApprovedCueCatalog(Mapping[str, ApprovedCue]):
 
         return cue_id in self._cues
 
+    @property
+    def content_sha256(self) -> str:
+        """Return a deterministic digest of every safety-relevant cue field.
+
+        Entries are ordered by cue ID so the digest identifies catalog content,
+        not construction order.  Keeping an expected digest in a review test
+        makes any identifier, kind, or literal phrase change explicit.
+        """
+
+        payload = [
+            {
+                "cue_id": cue.cue_id,
+                "kind": cue.kind.value,
+                "spoken_text": cue.spoken_text,
+            }
+            for cue in sorted(self._cues.values(), key=lambda cue: cue.cue_id)
+        ]
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
 
 DEFAULT_CUE_CATALOG = ApprovedCueCatalog(
     (
+        ApprovedCue(
+            CueId.SQUAT_SET_INTRO,
+            "Hi Max. Let's start with a set of three squats.",
+            CueKind.INSTRUCTION,
+        ),
+        ApprovedCue(
+            CueId.SQUAT_PERSON_DETECTED,
+            "I can see you. Now do the squats.",
+            CueKind.INSTRUCTION,
+        ),
         ApprovedCue(
             CueId.READY,
             "When you are ready, begin the movement.",
@@ -128,9 +167,13 @@ DEFAULT_CUE_CATALOG = ApprovedCueCatalog(
             "That completes this session.",
             CueKind.STATUS,
         ),
-        ApprovedCue(CueId.SQUAT_REP_ONE, "That was one.", CueKind.STATUS),
-        ApprovedCue(CueId.SQUAT_REP_TWO, "That's two.", CueKind.STATUS),
-        ApprovedCue(CueId.SQUAT_REP_THREE, "That's three.", CueKind.STATUS),
+        ApprovedCue(CueId.SQUAT_REP_ONE, "One.", CueKind.STATUS),
+        ApprovedCue(CueId.SQUAT_REP_TWO, "Slower.", CueKind.CORRECTION),
+        ApprovedCue(
+            CueId.SQUAT_REP_THREE,
+            "Three. Excellent. Now bring your arms out into a T shape.",
+            CueKind.STATUS,
+        ),
         ApprovedCue(CueId.SQUAT_REP_FOUR, "Four. Nice and steady.", CueKind.STATUS),
         ApprovedCue(CueId.SQUAT_REP_FIVE, "That's five. Halfway there.", CueKind.STATUS),
         ApprovedCue(CueId.SQUAT_REP_SIX, "That's six.", CueKind.STATUS),
@@ -144,4 +187,15 @@ DEFAULT_CUE_CATALOG = ApprovedCueCatalog(
             CueKind.CORRECTION,
         ),
     )
+)
+
+
+# These two cues are the only ones that may be selected without an assessable
+# movement observation.  The Guardian still validates them against both this
+# closed set and the active exercise plan before it issues a CUE decision.
+SQUAT_SCRIPTED_SESSION_CUE_IDS = frozenset(
+    {
+        CueId.SQUAT_SET_INTRO.value,
+        CueId.SQUAT_PERSON_DETECTED.value,
+    }
 )

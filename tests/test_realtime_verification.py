@@ -86,7 +86,7 @@ def _authorization(cue_id: CueId = CueId.MOVE_SLOWLY) -> ApprovedCuePlaybackAuth
         cue_kind=cue.kind,
         catalog_version=DEFAULT_CUE_CATALOG_VERSION,
         guardian_rule_version="guardian-verification-test-v1",
-        reason_codes=(GuardianReason.LEARNED_MODEL_CUE_ACCEPTED,),
+        reason_codes=(GuardianReason.LOCAL_CUE_ACCEPTED,),
     )
 
 

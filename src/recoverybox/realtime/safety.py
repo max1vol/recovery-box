@@ -19,7 +19,6 @@ never enter the prompt-cue lane merely because it resembles an approved cue.
 
 from __future__ import annotations
 
-import unicodedata
 from collections import deque
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -159,7 +158,7 @@ class ModelAudioGate:
 
         if mode is ConversationMode.ACTIVE_EXERCISE:
             if policy is ModelAudioPolicy.PROMPT_CUE_QUARANTINE:
-                if authorized_text is None or not normalize_authorized_text(authorized_text):
+                if authorized_text is None or not authorized_text.strip():
                     raise AudioGateError("PROMPT_CUE_QUARANTINE needs a nonblank catalog phrase")
             elif policy is ModelAudioPolicy.NO_AUDIO:
                 if authorized_text is not None:
@@ -183,7 +182,7 @@ class ModelAudioGate:
                     "CONVERSATIONAL_STREAM does not claim transcript authorization"
                 )
         elif policy is ModelAudioPolicy.TRANSCRIPT_QUARANTINE:
-            if authorized_text is None or not normalize_authorized_text(authorized_text):
+            if authorized_text is None or not authorized_text.strip():
                 raise AudioGateError("TRANSCRIPT_QUARANTINE needs nonblank locally authorized text")
         else:  # Defensive if a non-enum value crosses a Python boundary.
             raise AudioGateError("unsupported model audio policy")
@@ -360,9 +359,7 @@ class ModelAudioGate:
         if not state.audio_done or not state.transcript_done:
             return ()
 
-        expected = normalize_authorized_text(authorization.authorized_text or "")
-        actual = normalize_authorized_text(state.transcript or "")
-        if actual != expected:
+        if state.transcript != authorization.authorized_text:
             self._deny_content(key)
             return ()
 
@@ -430,9 +427,7 @@ class ModelAudioGate:
                 key = next(iter(content_keys))
                 state = self._quarantines.get(key)
                 if state is not None and state.audio_done and state.transcript_done:
-                    expected = normalize_authorized_text(authorization.authorized_text or "")
-                    actual = normalize_authorized_text(state.transcript or "")
-                    if actual == expected:
+                    if state.transcript == authorization.authorized_text:
                         released = self._release_content(key, authorization)
 
         # response.done is terminal.  Any incomplete, failed, cancelled,
@@ -451,14 +446,14 @@ class ModelAudioGate:
 
 
 def normalize_authorized_text(text: str) -> str:
-    """Apply only Unicode composition and whitespace normalization.
+    """Return authorization text unchanged.
 
-    Case, wording, punctuation, apostrophes, and quotation marks remain exact.
-    This tolerates transport/transcription whitespace without turning a near
-    match into an authorization match.
+    The compatibility name remains public for existing callers, but the audio
+    release boundary deliberately performs no Unicode, case, punctuation, or
+    whitespace normalization.  Only literal string equality authorizes PCM.
     """
 
-    return " ".join(unicodedata.normalize("NFC", text).split())
+    return text
 
 
 def _present(value: str | None) -> str:

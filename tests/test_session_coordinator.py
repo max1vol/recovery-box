@@ -259,7 +259,7 @@ def test_every_active_exercise_audible_request_is_a_catalog_approved_cue_id() ->
                 _decision(
                     GuardianAction.CUE,
                     cue_id=cue_id.value,
-                    reason=GuardianReason.LEARNED_MODEL_CUE_ACCEPTED,
+                    reason=GuardianReason.LOCAL_CUE_ACCEPTED,
                 )
             )
         )
@@ -277,7 +277,7 @@ def test_every_active_exercise_audible_request_is_a_catalog_approved_cue_id() ->
         assert request.cue_kind is cue.kind
         assert request.catalog_version == coordinator.catalog_version
         assert request.guardian_rule_version == "guardian-test-v1"
-        assert request.reason_codes == (GuardianReason.LEARNED_MODEL_CUE_ACCEPTED,)
+        assert request.reason_codes == (GuardianReason.LOCAL_CUE_ACCEPTED,)
         assert not hasattr(request, "pcm")
         assert not hasattr(request, "spoken_text")
 
@@ -357,7 +357,11 @@ def test_prompt_cue_request_failure_pauses_and_preempts_model_audio() -> None:
 
     with pytest.raises(OSError, match="prompt cue request failed"):
         coordinator.apply_guardian_decision(
-            _decision(GuardianAction.CUE, cue_id=CueId.MOVE_SLOWLY.value)
+            _decision(
+                GuardianAction.CUE,
+                cue_id=CueId.MOVE_SLOWLY.value,
+                reason=GuardianReason.LOCAL_CUE_ACCEPTED,
+            )
         )
 
     assert coordinator.current_mode is SessionMode.PAUSED
@@ -370,10 +374,74 @@ def test_prompt_cue_request_failure_pauses_and_preempts_model_audio() -> None:
     assert model_gate.events == [("preempt_model",)]
 
 
-def test_guardian_decision_is_rejected_outside_exercise_lifecycle() -> None:
+def test_check_in_accepts_only_reviewed_script_cues_and_fails_closed_otherwise() -> None:
+    speaker = _CueSpeaker()
     coordinator = SessionCoordinator(
-        cue_playback=_CueSpeaker(),
+        cue_playback=speaker,
         initial_mode=SessionMode.CHECK_IN,
     )
-    with pytest.raises(SessionCompositionError, match="ACTIVE_EXERCISE or PAUSED"):
-        coordinator.apply_guardian_decision(_decision(GuardianAction.PAUSE))
+
+    intro = coordinator.apply_guardian_decision(
+        _decision(
+            GuardianAction.CUE,
+            cue_id=CueId.SQUAT_SET_INTRO.value,
+            reason=GuardianReason.LOCAL_CUE_ACCEPTED,
+        )
+    )
+
+    assert intro.current_mode is SessionMode.CHECK_IN
+    assert speaker.events[-1][1].cue_id is CueId.SQUAT_SET_INTRO
+
+    with pytest.raises(CueAuthorizationError, match="reviewed scripted"):
+        coordinator.apply_guardian_decision(
+            _decision(
+                GuardianAction.CUE,
+                cue_id=CueId.SQUAT_REP_ONE.value,
+                reason=GuardianReason.LOCAL_CUE_ACCEPTED,
+            )
+        )
+    assert coordinator.current_mode is SessionMode.PAUSED
+
+
+def test_scripted_check_in_to_active_preserves_cue_lane_but_preempts_arbitrary_audio() -> None:
+    speaker = _CueSpeaker()
+    model_gate = _ModelGate()
+    coordinator = SessionCoordinator(
+        cue_playback=speaker,
+        initial_mode=SessionMode.CHECK_IN,
+    )
+    coordinator.register_model_audio_preemptor(model_gate)
+    coordinator.apply_guardian_decision(
+        _decision(
+            GuardianAction.CUE,
+            cue_id=CueId.SQUAT_SET_INTRO.value,
+            reason=GuardianReason.LOCAL_CUE_ACCEPTED,
+        )
+    )
+
+    previous = coordinator.begin_active_exercise_from_check_in()
+
+    assert previous is SessionMode.CHECK_IN
+    assert coordinator.current_mode is SessionMode.ACTIVE_EXERCISE
+    assert [event[0] for event in speaker.events] == ["play_cue"]
+    assert model_gate.events == [("preempt_model",)]
+
+
+def test_forged_cue_without_guardian_provenance_fails_closed() -> None:
+    speaker = _CueSpeaker()
+    coordinator = SessionCoordinator(
+        cue_playback=speaker,
+        initial_mode=SessionMode.ACTIVE_EXERCISE,
+    )
+
+    with pytest.raises(CueAuthorizationError, match="approved catalog"):
+        coordinator.apply_guardian_decision(
+            _decision(
+                GuardianAction.CUE,
+                cue_id=CueId.SQUAT_REP_ONE.value,
+                reason=GuardianReason.WITHIN_LIMITS,
+            )
+        )
+
+    assert coordinator.current_mode is SessionMode.PAUSED
+    assert [event[0] for event in speaker.events] == ["preempt_model"]

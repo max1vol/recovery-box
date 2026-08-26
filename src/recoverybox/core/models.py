@@ -45,7 +45,6 @@ class GuardianReason(StrEnum):
     CUE_NOT_ALLOWED = "cue_not_allowed"
     LOCAL_CUE_ACCEPTED = "local_cue_accepted"
     LOCAL_CUE_IGNORED_FOR_SAFETY = "local_cue_ignored_for_safety"
-    LEARNED_MODEL_CUE_ACCEPTED = "learned_model_cue_accepted"
     LEARNED_MODEL_INCREASED_CAUTION = "learned_model_increased_caution"
     LEARNED_MODEL_PRESERVED_CAUTION = "learned_model_preserved_caution"
     LEARNED_MODEL_SUGGESTION_IGNORED = "learned_model_suggestion_ignored"
@@ -160,7 +159,11 @@ class ExercisePlan:
 
 @dataclass(frozen=True, slots=True)
 class LearnedSuggestion:
-    """Untrusted proposal from a learned model, validated by the Guardian."""
+    """Untrusted severity-only proposal from a learned model.
+
+    Learned output may preserve or increase caution, but it cannot nominate a
+    cue. Cue selection is reserved for the deterministic local Guardian path.
+    """
 
     action: GuardianAction
     cue_id: str | None = None
@@ -169,11 +172,9 @@ class LearnedSuggestion:
         if not isinstance(self.action, GuardianAction):
             raise TypeError("action must be a GuardianAction")
         if self.action is GuardianAction.CUE:
-            if self.cue_id is None or not isinstance(self.cue_id, str) or not self.cue_id.strip():
-                raise ValueError("a cue suggestion requires cue_id")
-            object.__setattr__(self, "cue_id", self.cue_id.strip())
-        elif self.cue_id is not None:
-            raise ValueError("cue_id is only valid for a cue suggestion")
+            raise ValueError("learned suggestions cannot select cues")
+        if self.cue_id is not None:
+            raise ValueError("learned suggestions cannot include cue_id")
 
 
 @dataclass(frozen=True, slots=True)

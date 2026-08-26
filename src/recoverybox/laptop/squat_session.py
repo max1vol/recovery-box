@@ -70,28 +70,25 @@ SQUAT_REP_CUE_IDS: tuple[CueId, ...] = (
     CueId.SQUAT_REP_ONE,
     CueId.SQUAT_REP_TWO,
     CueId.SQUAT_REP_THREE,
-    CueId.SQUAT_REP_FOUR,
-    CueId.SQUAT_REP_FIVE,
-    CueId.SQUAT_REP_SIX,
-    CueId.SQUAT_REP_SEVEN,
-    CueId.SQUAT_REP_EIGHT,
-    CueId.SQUAT_REP_NINE,
-    CueId.SQUAT_REP_TEN,
+)
+
+SQUAT_SCRIPT_CUE_IDS: tuple[CueId, ...] = (
+    CueId.SQUAT_SET_INTRO,
+    CueId.SQUAT_PERSON_DETECTED,
+    *SQUAT_REP_CUE_IDS,
 )
 
 
-def build_single_camera_squat_plan(*, target_reps: int = 10) -> ExercisePlan:
+def build_single_camera_squat_plan(*, target_reps: int = 3) -> ExercisePlan:
     """Build the reviewed one-camera plan used by the laptop prototype."""
 
     if isinstance(target_reps, bool) or not isinstance(target_reps, int):
         raise TypeError("target_reps must be an integer")
     if target_reps != len(SQUAT_REP_CUE_IDS):
-        raise ValueError("the reviewed laptop squat prompt catalog requires exactly 10 reps")
+        raise ValueError("the reviewed laptop squat script requires exactly 3 reps")
     return ExercisePlan(
         exercise_id=SQUAT_EXERCISE_ID,
-        allowed_cue_ids=frozenset(
-            cue_id.value for cue_id in (*SQUAT_REP_CUE_IDS, CueId.ARMS_T_SHAPE)
-        ),
+        allowed_cue_ids=frozenset(cue_id.value for cue_id in SQUAT_SCRIPT_CUE_IDS),
         target_reps=target_reps,
         min_confidence=0.70,
         max_pose_age_ms=500,
@@ -143,7 +140,7 @@ def observation_from_squat_analysis(
 def local_cue_request_for_squat_event(
     event: SquatEvent,
     *,
-    target_reps: int = 10,
+    target_reps: int = 3,
 ) -> LocalCueRequest | None:
     """Map a closed semantic event to a fixed cue ID, never to speech text."""
 
@@ -152,10 +149,12 @@ def local_cue_request_for_squat_event(
     if isinstance(target_reps, bool) or not isinstance(target_reps, int):
         raise TypeError("target_reps must be an integer")
     if target_reps != len(SQUAT_REP_CUE_IDS):
-        raise ValueError("the reviewed laptop squat prompt catalog requires exactly 10 reps")
+        raise ValueError("the reviewed laptop squat script requires exactly 3 reps")
 
     if event.event_type is SquatEventType.ARMS_NOT_IN_T:
-        return LocalCueRequest(CueId.ARMS_T_SHAPE.value)
+        # The third scripted rep cue introduces the T shape.  Form-correction
+        # reminders must not interrupt or race the three-squat sequence.
+        return None
     if event.event_type is SquatEventType.REP_COMPLETED:
         assert event.rep_count is not None
         if 1 <= event.rep_count <= target_reps:
@@ -251,9 +250,10 @@ class LaptopSquatSession:
     """Compose one persistent Realtime connection with local squat safety.
 
     ``start`` sends one session configuration event but does not activate pose
-    safety yet.  A launcher first obtains an assessable standing pose and then
-    explicitly calls :meth:`activate_exercise`.  Once active, any missing or
-    withheld analysis enters PAUSED and never auto-resumes.
+    safety yet. In voice mode, the first assessable standing pose requests the
+    fixed detection cue; only successful speaker playback plus a later standing
+    pose may activate the exercise. Camera-only mode activates directly. Once
+    active, any missing or withheld analysis enters PAUSED and never auto-resumes.
 
     ``on_cue_audio`` must enqueue the complete, already approved clip into a
     speaker arbiter and return promptly.  It must not play synchronously.
@@ -287,7 +287,7 @@ class LaptopSquatSession:
         if plan.exercise_id != SQUAT_EXERCISE_ID:
             raise ValueError("the laptop squat session requires the squat exercise plan")
         if plan.target_reps != len(SQUAT_REP_CUE_IDS):
-            raise ValueError("the reviewed laptop squat prompt catalog requires exactly 10 reps")
+            raise ValueError("the reviewed laptop squat script requires exactly 3 reps")
         if cue_delivery_config is not None and not isinstance(
             cue_delivery_config,
             CueDeliveryConfig,
@@ -316,6 +316,12 @@ class LaptopSquatSession:
         self._control_response_id: str | None = None
         self._deferred_cue_decisions: list[GuardianDecision] = []
         self._last_observed_rep_count = 0
+        self._activation_rep_count = 0
+        self._completed_rep_count = 0
+        self._person_detection_requested = False
+        self._person_detection_playback_succeeded = False
+        self._last_check_in_analysis_timestamp_ms: int | None = None
+        self._detection_playback_freshness_threshold_ms: int | None = None
 
         mode_provider = _CoordinatorModeProvider()
         delivery_options: dict[str, object] = {}
@@ -332,6 +338,9 @@ class LaptopSquatSession:
             on_preempt=on_audio_preempt,
             on_failure=self._on_cue_delivery_failure,
             count_cue_ids=SQUAT_REP_CUE_IDS,
+            ordered_cue_ids=SQUAT_SCRIPT_CUE_IDS,
+            allowed_modes=(SessionMode.CHECK_IN, SessionMode.ACTIVE_EXERCISE),
+            check_in_cue_ids=(CueId.SQUAT_SET_INTRO, CueId.SQUAT_PERSON_DETECTED),
             **delivery_options,  # type: ignore[arg-type]
         )
         self._coordinator = SessionCoordinator(
@@ -397,8 +406,15 @@ class LaptopSquatSession:
         with self._state_lock:
             return self._last_cue_failure
 
+    @property
+    def completed_rep_count(self) -> int:
+        """Number of scripted reps completed after exercise activation."""
+
+        with self._state_lock:
+            return self._completed_rep_count
+
     def start(self, *, instructions: str, voice: str) -> None:
-        """Configure the existing connection exactly once; keep it in IDLE."""
+        """Configure once and issue the Guardian-authorized welcome cue."""
 
         with self._state_lock:
             if self._closed:
@@ -415,6 +431,15 @@ class LaptopSquatSession:
                     instructions=session_instructions,
                     voice=voice,
                 )
+                self._coordinator.transition_to(SessionMode.CHECK_IN)
+                intro = self._guardian.decide_scripted_session_cue(
+                    LocalCueRequest(CueId.SQUAT_SET_INTRO.value),
+                    self._plan,
+                )
+                if intro.action is not GuardianAction.CUE:
+                    self._coordinator.apply_guardian_decision(intro)
+                    raise RuntimeError("Guardian rejected the reviewed squat introduction")
+                self._coordinator.apply_guardian_decision(intro)
             self._started = True
 
     def activate_exercise(
@@ -423,7 +448,14 @@ class LaptopSquatSession:
         *,
         pose_age_ms: int = 0,
     ) -> bool:
-        """Enter ACTIVE only from an explicitly supplied assessable stand."""
+        """Enter ACTIVE only from an explicitly supplied assessable stand.
+
+        Voice-enabled sessions first use one standing observation to request
+        the fixed person-detected cue. They remain in ``CHECK_IN`` until the
+        speaker bridge confirms that exact cue finished playing, then require
+        a later standing observation before activation. Camera-only sessions
+        retain their direct ``IDLE`` activation path.
+        """
 
         self._require_running()
         observation = observation_from_squat_analysis(
@@ -434,16 +466,70 @@ class LaptopSquatSession:
         with self._request_lock:
             if self._cue_delivery_enabled and not self._is_realtime_available():
                 return False
-            if self._coordinator.current_mode is not SessionMode.IDLE:
-                raise RuntimeError("exercise activation requires IDLE mode")
+            mode = self._coordinator.current_mode
+            if mode not in {SessionMode.IDLE, SessionMode.CHECK_IN}:
+                raise RuntimeError("exercise activation requires IDLE or CHECK_IN mode")
             if not analysis.assessable or analysis.phase is not SquatPhase.STANDING:
                 return False
             decision = self._guardian.decide(observation, self._plan)
             if decision.action is not GuardianAction.CONTINUE:
                 return False
-            self._coordinator.transition_to(SessionMode.ACTIVE_EXERCISE)
+            if mode is SessionMode.CHECK_IN:
+                if not self._person_detection_requested:
+                    detected = self._guardian.decide_scripted_session_cue(
+                        LocalCueRequest(CueId.SQUAT_PERSON_DETECTED.value),
+                        self._plan,
+                    )
+                    if detected.action is not GuardianAction.CUE:
+                        self._coordinator.apply_guardian_decision(detected)
+                        return False
+                    self._coordinator.apply_guardian_decision(detected)
+                    self._person_detection_requested = True
+                    self._last_check_in_analysis_timestamp_ms = analysis.timestamp_ms
+                    return False
+                if not self._person_detection_playback_succeeded:
+                    self._remember_check_in_analysis_timestamp_locked(analysis.timestamp_ms)
+                    return False
+                freshness_threshold = self._detection_playback_freshness_threshold_ms
+                if freshness_threshold is not None and analysis.timestamp_ms <= freshness_threshold:
+                    self._remember_check_in_analysis_timestamp_locked(analysis.timestamp_ms)
+                    return False
+                self._coordinator.begin_active_exercise_from_check_in()
+            else:
+                self._coordinator.transition_to(SessionMode.ACTIVE_EXERCISE)
             with self._state_lock:
                 self._last_observed_rep_count = analysis.rep_count
+                self._activation_rep_count = analysis.rep_count
+                self._completed_rep_count = 0
+            return True
+
+    def notify_cue_playback_succeeded(self, cue_id: CueId) -> bool:
+        """Latch successful playback of the one activation-gating cue.
+
+        Production code calls this narrow notification only from
+        ``_CueSpeakerBridge`` after its playback ticket completes without an
+        error. Realtime response completion alone is intentionally
+        insufficient. The return value reports whether this call newly armed
+        activation; it never activates the exercise itself.
+        """
+
+        if not isinstance(cue_id, CueId):
+            raise TypeError("cue_id must be a CueId")
+        if cue_id is not CueId.SQUAT_PERSON_DETECTED:
+            return False
+        with self._request_lock:
+            if (
+                self._closed
+                or not self._person_detection_requested
+                or self._person_detection_playback_succeeded
+                or not self._is_realtime_available()
+                or self._coordinator.current_mode is not SessionMode.CHECK_IN
+            ):
+                return False
+            self._person_detection_playback_succeeded = True
+            self._detection_playback_freshness_threshold_ms = (
+                self._last_check_in_analysis_timestamp_ms
+            )
             return True
 
     def resume_after_assessable_pose(
@@ -491,6 +577,23 @@ class LaptopSquatSession:
         )
         with self._request_lock:
             mode = self._coordinator.current_mode
+            if mode is SessionMode.CHECK_IN:
+                activation_failed = False
+                if analysis.assessable and analysis.phase is SquatPhase.STANDING:
+                    try:
+                        self.activate_exercise(analysis, pose_age_ms=pose_age_ms)
+                    except Exception as exc:
+                        activation_failed = True
+                        if self._is_realtime_available():
+                            self._mark_realtime_unavailable_locked(type(exc).__name__)
+                return SquatSessionAnalysisResult(
+                    analysis=analysis,
+                    observation=observation,
+                    decisions=(),
+                    effects=(),
+                    cue_delivery_failed=activation_failed,
+                    mode=self._coordinator.current_mode,
+                )
             if mode is SessionMode.IDLE or mode not in {
                 SessionMode.ACTIVE_EXERCISE,
                 SessionMode.PAUSED,
@@ -527,8 +630,11 @@ class LaptopSquatSession:
                 and self._coordinator.current_mode is SessionMode.ACTIVE_EXERCISE
             ):
                 for event in analysis.events:
+                    scripted_event = self._script_relative_event_locked(event)
+                    if scripted_event is None:
+                        continue
                     cue_request = local_cue_request_for_squat_event(
-                        event,
+                        scripted_event,
                         target_reps=self._plan.target_reps,
                     )
                     if cue_request is None:
@@ -539,6 +645,13 @@ class LaptopSquatSession:
                         local_cue_request=cue_request,
                     )
                     decisions.append(decision)
+                    if scripted_event.event_type is SquatEventType.REP_COMPLETED:
+                        assert scripted_event.rep_count is not None
+                        with self._state_lock:
+                            self._completed_rep_count = max(
+                                self._completed_rep_count,
+                                scripted_event.rep_count,
+                            )
                     if not self._cue_delivery_enabled:
                         continue
                     if not self._is_realtime_available():
@@ -795,15 +908,25 @@ class LaptopSquatSession:
         self._last_observed_rep_count = analysis.rep_count
         return True
 
+    def _remember_check_in_analysis_timestamp_locked(self, timestamp_ms: int) -> None:
+        previous = self._last_check_in_analysis_timestamp_ms
+        if previous is None or timestamp_ms > previous:
+            self._last_check_in_analysis_timestamp_ms = timestamp_ms
+
+    def _script_relative_event_locked(self, event: SquatEvent) -> SquatEvent | None:
+        if event.event_type is not SquatEventType.REP_COMPLETED:
+            return event
+        assert event.rep_count is not None
+        relative_rep_count = event.rep_count - self._activation_rep_count
+        if relative_rep_count < 1:
+            return None
+        return SquatEvent(
+            event_type=SquatEventType.REP_COMPLETED,
+            rep_count=relative_rep_count,
+        )
+
     def _defer_cue_decision_locked(self, decision: GuardianDecision) -> None:
-        cue_id = CueId(decision.cue_id or "")
-        if cue_id in SQUAT_REP_CUE_IDS:
-            self._deferred_cue_decisions = [
-                existing
-                for existing in self._deferred_cue_decisions
-                if CueId(existing.cue_id or "") not in SQUAT_REP_CUE_IDS
-            ]
-        elif any(existing.cue_id == decision.cue_id for existing in self._deferred_cue_decisions):
+        if any(existing.cue_id == decision.cue_id for existing in self._deferred_cue_decisions):
             return
         self._deferred_cue_decisions.append(decision)
 
@@ -892,6 +1015,7 @@ __all__ = [
     "SESSION_END_POLICY_INSTRUCTIONS",
     "SQUAT_EXERCISE_ID",
     "SQUAT_REP_CUE_IDS",
+    "SQUAT_SCRIPT_CUE_IDS",
     "LaptopSquatSession",
     "SquatAudioTurnResult",
     "SquatSessionAnalysisResult",

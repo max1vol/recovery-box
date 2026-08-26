@@ -29,6 +29,7 @@ from recoverybox.core import (
     GuardianReason,
     SessionMode,
 )
+from recoverybox.core.cues import SQUAT_SCRIPTED_SESSION_CUE_IDS
 
 
 class SessionCompositionError(RuntimeError):
@@ -39,7 +40,7 @@ class CueAuthorizationError(SessionCompositionError):
     """A Guardian cue decision did not resolve to an approved prompt cue."""
 
 
-DEFAULT_CUE_CATALOG_VERSION = "prompt-cues-v2"
+DEFAULT_CUE_CATALOG_VERSION = "prompt-cues-v3"
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,6 +212,36 @@ class SessionCoordinator(SessionModeProvider):
                     self._mode = mode
             return previous
 
+    def begin_active_exercise_from_check_in(self) -> SessionMode:
+        """Enter ACTIVE while preserving only the exact prompt-cue lane.
+
+        A CHECK_IN welcome or detection cue may still be in the quarantined
+        lane when the first assessable standing pose arrives.  This transition
+        closes every separately registered arbitrary-model audio gate, but does
+        not cancel those already Guardian-authorized fixed cues.  Any failure
+        publishes PAUSED and scrubs the cue lane fail-closed.
+        """
+
+        with self._operation_lock:
+            if self.current_mode is not SessionMode.CHECK_IN:
+                raise SessionCompositionError("scripted exercise activation requires CHECK_IN mode")
+            with self._lock:
+                preemptors = tuple(self._model_audio_preemptors)
+            try:
+                for preemptor in preemptors:
+                    preemptor.preempt_model_audio()
+            except Exception as exc:
+                try:
+                    self.transition_to(SessionMode.PAUSED)
+                except Exception:
+                    pass
+                raise SessionCompositionError(
+                    "arbitrary model audio preemption failed during exercise activation"
+                ) from exc
+            with self._lock:
+                self._mode = SessionMode.ACTIVE_EXERCISE
+            return SessionMode.CHECK_IN
+
     def apply_guardian_decision(
         self,
         decision: GuardianDecision,
@@ -235,9 +266,13 @@ class SessionCoordinator(SessionModeProvider):
         """Apply one already-validated decision under the operation lock."""
 
         previous = self.current_mode
-        if previous not in {SessionMode.ACTIVE_EXERCISE, SessionMode.PAUSED}:
+        if previous not in {
+            SessionMode.CHECK_IN,
+            SessionMode.ACTIVE_EXERCISE,
+            SessionMode.PAUSED,
+        }:
             raise SessionCompositionError(
-                "Guardian exercise decisions require ACTIVE_EXERCISE or PAUSED mode"
+                "Guardian decisions require CHECK_IN, ACTIVE_EXERCISE, or PAUSED mode"
             )
 
         if decision.action is GuardianAction.CONTINUE:
@@ -249,11 +284,17 @@ class SessionCoordinator(SessionModeProvider):
             )
 
         if decision.action is GuardianAction.CUE:
-            if previous is not SessionMode.ACTIVE_EXERCISE:
-                raise CueAuthorizationError("approved cues can play only in ACTIVE_EXERCISE")
+            if previous is SessionMode.CHECK_IN:
+                if decision.cue_id not in SQUAT_SCRIPTED_SESSION_CUE_IDS:
+                    self.transition_to(SessionMode.PAUSED)
+                    raise CueAuthorizationError("only reviewed scripted cues can play in CHECK_IN")
+            elif previous is not SessionMode.ACTIVE_EXERCISE:
+                raise CueAuthorizationError(
+                    "approved cues can play only in CHECK_IN or ACTIVE_EXERCISE"
+                )
             try:
                 authorization = self._authorize_cue(decision)
-            except (KeyError, TypeError, ValueError) as exc:
+            except (CueAuthorizationError, KeyError, TypeError, ValueError) as exc:
                 self.transition_to(SessionMode.PAUSED)
                 raise CueAuthorizationError("Guardian cue is not in the approved catalog") from exc
 
@@ -266,7 +307,7 @@ class SessionCoordinator(SessionModeProvider):
                 raise
             return GuardianDecisionEffect(
                 previous_mode=previous,
-                current_mode=SessionMode.ACTIVE_EXERCISE,
+                current_mode=previous,
                 action=decision.action,
                 cue_authorization=authorization,
                 model_audio_preempted=False,
@@ -291,6 +332,8 @@ class SessionCoordinator(SessionModeProvider):
         self,
         decision: GuardianDecision,
     ) -> ApprovedCuePlaybackAuthorization:
+        if GuardianReason.LOCAL_CUE_ACCEPTED not in decision.reason_codes:
+            raise CueAuthorizationError("cue decision lacks Guardian authorization provenance")
         cue_id = CueId(decision.cue_id or "")
         cue = self._cue_catalog[cue_id.value]
         if not self._cue_catalog.is_approved(cue_id.value):

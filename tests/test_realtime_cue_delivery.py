@@ -72,7 +72,7 @@ def _authorization(cue_id: CueId) -> ApprovedCuePlaybackAuthorization:
         cue_kind=cue.kind,
         catalog_version=DEFAULT_CUE_CATALOG_VERSION,
         guardian_rule_version="guardian-squat-v1",
-        reason_codes=(GuardianReason.LEARNED_MODEL_CUE_ACCEPTED,),
+        reason_codes=(GuardianReason.LOCAL_CUE_ACCEPTED,),
     )
 
 
@@ -173,7 +173,7 @@ def test_pcm_waits_for_terminal_completed_response_and_reports_latency() -> None
     assert harness.delivery.snapshot.released_count == 1
 
 
-def test_latest_count_leapfrogs_but_never_interrupts_active_safety_cue() -> None:
+def test_latest_generic_count_leapfrogs_but_never_interrupts_active_safety_cue() -> None:
     harness = _Harness()
     harness.delivery.enqueue(_authorization(CueId.CAMERA_PAUSE))
     correction = harness.delivery.enqueue(_authorization(CueId.MOVE_SLOWLY))
@@ -187,7 +187,11 @@ def test_latest_count_leapfrogs_but_never_interrupts_active_safety_cue() -> None
     assert newest_count.disposition is CueQueueDisposition.SUPERSEDED_COUNT
     snapshot = harness.delivery.snapshot
     assert snapshot.active_cue_id is CueId.CAMERA_PAUSE
-    assert snapshot.pending_cue_ids == (CueId.HOLD_POSITION, CueId.MOVE_SLOWLY)
+    assert snapshot.pending_cue_ids == (
+        CueId.HOLD_POSITION,
+        CueId.MOVE_SLOWLY,
+    )
+    assert snapshot.superseded_count == 1
     assert len(harness.transport.sent) == 1
 
     _complete_exact(harness, CueId.CAMERA_PAUSE, "safety")
@@ -196,6 +200,186 @@ def test_latest_count_leapfrogs_but_never_interrupts_active_safety_cue() -> None
     assert harness.transport.sent[-1]["response"]["metadata"]["cue_id"] == (
         CueId.HOLD_POSITION.value
     )
+
+
+def test_ordered_script_survives_check_in_to_active_and_releases_fifo() -> None:
+    harness = _Harness(mode=_ModeProvider(SessionMode.CHECK_IN))
+    harness.delivery = RealtimeCueDelivery(
+        session=harness.session,
+        mode_provider=harness.mode,
+        on_audio=harness.released.append,
+        on_failure=harness.failures.append,
+        on_preempt=lambda: harness.preemptions.append("preempt"),
+        ordered_cue_ids={
+            CueId.SQUAT_SET_INTRO,
+            CueId.SQUAT_PERSON_DETECTED,
+            CueId.SQUAT_REP_ONE,
+            CueId.SQUAT_REP_TWO,
+            CueId.SQUAT_REP_THREE,
+        },
+        allowed_modes={SessionMode.CHECK_IN, SessionMode.ACTIVE_EXERCISE},
+        check_in_cue_ids={CueId.SQUAT_SET_INTRO, CueId.SQUAT_PERSON_DETECTED},
+        clock=harness.clock,
+    )
+
+    harness.delivery.enqueue(_authorization(CueId.SQUAT_SET_INTRO))
+    harness.delivery.enqueue(_authorization(CueId.SQUAT_PERSON_DETECTED))
+    harness.mode.current_mode = SessionMode.ACTIVE_EXERCISE
+    harness.delivery.enqueue(_authorization(CueId.SQUAT_REP_ONE))
+    harness.delivery.enqueue(_authorization(CueId.SQUAT_REP_TWO))
+    harness.delivery.enqueue(_authorization(CueId.SQUAT_REP_THREE))
+
+    assert harness.delivery.snapshot.pending_cue_ids == (
+        CueId.SQUAT_PERSON_DETECTED,
+        CueId.SQUAT_REP_ONE,
+        CueId.SQUAT_REP_TWO,
+        CueId.SQUAT_REP_THREE,
+    )
+    expected = (
+        CueId.SQUAT_SET_INTRO,
+        CueId.SQUAT_PERSON_DETECTED,
+        CueId.SQUAT_REP_ONE,
+        CueId.SQUAT_REP_TWO,
+        CueId.SQUAT_REP_THREE,
+    )
+    for index, cue_id in enumerate(expected):
+        assert harness.transport.sent[-1]["response"]["metadata"]["cue_id"] == cue_id.value
+        harness.released.clear()
+        _complete_exact(harness, cue_id, f"script-{index}")
+        assert [release.authorization.cue_id for release in harness.released] == [cue_id]
+
+    assert harness.delivery.snapshot.pending_cue_ids == ()
+    assert harness.delivery.snapshot.released_count == len(expected)
+
+
+def test_ordered_rep_cues_never_expire_while_preceding_responses_finish_fifo() -> None:
+    harness = _Harness()
+    harness.delivery = RealtimeCueDelivery(
+        session=harness.session,
+        mode_provider=harness.mode,
+        on_audio=harness.released.append,
+        on_failure=harness.failures.append,
+        ordered_cue_ids={
+            CueId.SQUAT_REP_ONE,
+            CueId.SQUAT_REP_TWO,
+            CueId.SQUAT_REP_THREE,
+        },
+        config=CueDeliveryConfig(response_timeout_seconds=8.0),
+        clock=harness.clock,
+    )
+
+    harness.delivery.enqueue(_authorization(CueId.SQUAT_REP_ONE))
+    harness.delivery.enqueue(_authorization(CueId.SQUAT_REP_TWO))
+    harness.delivery.enqueue(_authorization(CueId.SQUAT_REP_THREE))
+
+    assert harness.delivery.snapshot.pending_cue_ids == (
+        CueId.SQUAT_REP_TWO,
+        CueId.SQUAT_REP_THREE,
+    )
+    harness.clock.advance(7.9)
+    _complete_exact(harness, CueId.SQUAT_REP_ONE, "slow-rep-one")
+    assert harness.transport.sent[-1]["response"]["metadata"]["cue_id"] == (
+        CueId.SQUAT_REP_TWO.value
+    )
+
+    harness.released.clear()
+    harness.clock.advance(7.9)
+    _complete_exact(harness, CueId.SQUAT_REP_TWO, "slow-rep-two")
+
+    # Rep three has now waited 15.8 seconds, longer than the removed SCRIPT
+    # age limit, but remains the next request and was never counted stale.
+    assert harness.transport.sent[-1]["response"]["metadata"]["cue_id"] == (
+        CueId.SQUAT_REP_THREE.value
+    )
+    assert harness.delivery.snapshot.active_cue_id is CueId.SQUAT_REP_THREE
+    assert harness.delivery.snapshot.stale_drop_count == 0
+
+
+def test_script_timeout_fails_closed_and_clears_all_pending_steps() -> None:
+    harness = _Harness()
+    harness.delivery = RealtimeCueDelivery(
+        session=harness.session,
+        mode_provider=harness.mode,
+        on_audio=harness.released.append,
+        on_failure=harness.failures.append,
+        on_preempt=lambda: harness.preemptions.append("preempt"),
+        ordered_cue_ids={
+            CueId.SQUAT_REP_ONE,
+            CueId.SQUAT_REP_TWO,
+            CueId.SQUAT_REP_THREE,
+        },
+        config=CueDeliveryConfig(response_timeout_seconds=8.0),
+        clock=harness.clock,
+    )
+
+    harness.delivery.enqueue(_authorization(CueId.SQUAT_REP_ONE))
+    harness.delivery.enqueue(_authorization(CueId.SQUAT_REP_TWO))
+    harness.delivery.enqueue(_authorization(CueId.SQUAT_REP_THREE))
+    harness.route(_created("resp-script-timeout", "created-script-timeout"))
+    harness.clock.advance(8.1)
+
+    assert harness.delivery.expire_stale() == 0
+
+    snapshot = harness.delivery.snapshot
+    assert snapshot.active_cue_id is None
+    assert snapshot.pending_cue_ids == ()
+    assert snapshot.draining_stale_response
+    assert snapshot.stale_drop_count == 0
+    assert harness.preemptions == ["preempt"]
+    assert harness.failures == [
+        CueDeliveryFailure(
+            ticket_id=1,
+            cue_id=CueId.SQUAT_REP_ONE,
+            reason=CueDeliveryFailureReason.RESPONSE_TIMEOUT,
+            response_id="resp-script-timeout",
+        )
+    ]
+
+    assert harness.route(
+        _response_done(
+            "resp-script-timeout",
+            "done-script-timeout",
+            status="cancelled",
+        )
+    )
+    assert not harness.delivery.snapshot.draining_stale_response
+    assert len(harness.transport.sent) == 2  # create, then scoped cancellation
+
+
+def test_repeated_script_id_is_queued_as_distinct_fifo_work() -> None:
+    harness = _Harness()
+    harness.delivery = RealtimeCueDelivery(
+        session=harness.session,
+        mode_provider=harness.mode,
+        on_audio=harness.released.append,
+        ordered_cue_ids={CueId.SQUAT_REP_ONE},
+        clock=harness.clock,
+    )
+
+    first = harness.delivery.enqueue(_authorization(CueId.SQUAT_REP_ONE))
+    second = harness.delivery.enqueue(_authorization(CueId.SQUAT_REP_ONE))
+
+    assert first.disposition is CueQueueDisposition.STARTED
+    assert second.disposition is CueQueueDisposition.QUEUED
+    assert second.ticket_id != first.ticket_id
+    assert harness.delivery.snapshot.pending_cue_ids == (CueId.SQUAT_REP_ONE,)
+    assert harness.delivery.snapshot.coalesced_count == 0
+
+
+def test_check_in_allowance_rejects_non_scripted_catalog_cues() -> None:
+    harness = _Harness(mode=_ModeProvider(SessionMode.CHECK_IN))
+    delivery = RealtimeCueDelivery(
+        session=harness.session,
+        mode_provider=harness.mode,
+        on_audio=harness.released.append,
+        allowed_modes={SessionMode.CHECK_IN, SessionMode.ACTIVE_EXERCISE},
+        check_in_cue_ids={CueId.SQUAT_SET_INTRO, CueId.SQUAT_PERSON_DETECTED},
+    )
+
+    with pytest.raises(CueDeliveryError, match="allowed session mode"):
+        delivery.enqueue(_authorization(CueId.SQUAT_REP_ONE))
+
+    assert harness.transport.sent == []
 
 
 def test_completed_response_without_exact_quarantined_audio_fails_closed() -> None:

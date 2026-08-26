@@ -34,8 +34,10 @@ PCM = b"\x01\x00\x02\x00"
 
 
 class _FailingCueTransport(MemoryTransport):
+    fail_cues = False
+
     def send_event(self, event: dict) -> None:
-        if event.get("type") == "response.create":
+        if self.fail_cues and event.get("type") == "response.create":
             raise OSError("simulated network failure")
         super().send_event(event)
 
@@ -69,10 +71,12 @@ class _BlockingCueSendTransport(MemoryTransport):
         self.release_cue_send = threading.Event()
         self.close_entered = threading.Event()
         self.release_close = threading.Event()
+        self.block_cues = False
 
     def send_event(self, event: dict) -> None:
         self.sent.append(dict(event))
-        if event.get("type") == "response.create":
+        cue_id = event.get("response", {}).get("metadata", {}).get("cue_id")
+        if self.block_cues and cue_id in {cue.value for cue in SQUAT_REP_CUE_IDS}:
             self.cue_send_entered.set()
             self.release_cue_send.wait()
 
@@ -132,8 +136,21 @@ def build_app(
     return app, selected_transport, released, preemptions
 
 
-def activate(app: LaptopSquatSession) -> None:
-    assert app.activate_exercise(analysis())
+def activate(
+    app: LaptopSquatSession,
+    *,
+    delivery_transport: MemoryTransport | None = None,
+) -> None:
+    assert not app.activate_exercise(analysis(timestamp_ms=10))
+    assert app.coordinator.current_mode is SessionMode.CHECK_IN
+    transport = delivery_transport or app.realtime_session.transport
+    assert isinstance(transport, MemoryTransport)
+    complete_exact_cue(app, transport, CueId.SQUAT_SET_INTRO, "intro")
+    complete_exact_cue(app, transport, CueId.SQUAT_PERSON_DETECTED, "detected")
+    assert app.coordinator.current_mode is SessionMode.CHECK_IN
+    assert app.notify_cue_playback_succeeded(CueId.SQUAT_PERSON_DETECTED)
+    assert not app.activate_exercise(analysis(timestamp_ms=10))
+    assert app.activate_exercise(analysis(timestamp_ms=20))
     assert app.coordinator.current_mode is SessionMode.ACTIVE_EXERCISE
 
 
@@ -190,6 +207,33 @@ def response_done(response_id: str, *, output: list[dict] | None = None) -> dict
     }
 
 
+def complete_exact_cue(
+    app: LaptopSquatSession,
+    transport: MemoryTransport,
+    cue_id: CueId,
+    suffix: str,
+) -> None:
+    response_id = f"script-{suffix}"
+    item_id = f"item-{suffix}"
+    transport.incoming.extend(
+        (
+            created(response_id),
+            audio_delta(response_id, item_id),
+            audio_done(response_id, item_id),
+            transcript_done(
+                response_id,
+                item_id,
+                DEFAULT_CUE_CATALOG[cue_id].spoken_text,
+            ),
+            response_done(response_id),
+        )
+    )
+    for _ in range(5):
+        dispatched = app.pump_once()
+        assert dispatched.failure_kind is None
+        assert dispatched.cue_event_consumed
+
+
 def error_event(event_id: str = "error-control") -> dict:
     return {
         "type": "error",
@@ -209,26 +253,29 @@ def test_start_configures_one_persistent_session_with_only_finish_tool() -> None
     assert transport.sent == []
     app.start(instructions="Short exercise session.", voice="marin")
 
-    assert len(transport.sent) == 1
+    assert len(transport.sent) == 2
     update = transport.sent[0]
     assert update["type"] == "session.update"
     assert [tool["name"] for tool in update["session"]["tools"]] == ["finish_session"]
     assert update["session"]["audio"]["input"]["turn_detection"] is None
     assert SESSION_END_POLICY_INSTRUCTIONS.strip() in update["session"]["instructions"]
-    assert app.coordinator.current_mode is SessionMode.IDLE
+    intro = transport.sent[1]
+    assert intro["type"] == "response.create"
+    assert intro["response"]["metadata"]["cue_id"] == CueId.SQUAT_SET_INTRO.value
+    assert app.coordinator.current_mode is SessionMode.CHECK_IN
     assert not transport.closed
     with pytest.raises(RuntimeError, match="already started"):
         app.start(instructions="Again.", voice="marin")
 
 
-def test_composition_requires_preemption_and_the_reviewed_squat_ten_rep_plan() -> None:
+def test_composition_requires_preemption_and_the_reviewed_three_rep_plan() -> None:
     with pytest.raises(TypeError, match="on_audio_preempt"):
         LaptopSquatSession(
             transport=MemoryTransport(),
             on_cue_audio=lambda _: None,
             on_audio_preempt=None,  # type: ignore[arg-type]
         )
-    with pytest.raises(ValueError, match="exactly 10"):
+    with pytest.raises(ValueError, match="exactly 3"):
         build_single_camera_squat_plan(target_reps=5)
     with pytest.raises(ValueError, match="squat exercise plan"):
         LaptopSquatSession(
@@ -239,20 +286,117 @@ def test_composition_requires_preemption_and_the_reviewed_squat_ten_rep_plan() -
         )
 
 
-def test_startup_missing_pose_stays_idle_until_explicit_standing_activation() -> None:
+def test_startup_requires_detection_playback_then_a_fresh_standing_analysis() -> None:
     app, transport, _, _ = build_app()
 
     update = app.process_analysis(missing_analysis())
 
-    assert update.mode is SessionMode.IDLE
+    assert update.mode is SessionMode.CHECK_IN
     assert update.decisions == ()
     assert app.activate_exercise(missing_analysis()) is False
     assert app.activate_exercise(analysis(phase=SquatPhase.DOWN)) is False
-    assert app.coordinator.current_mode is SessionMode.IDLE
+    assert app.coordinator.current_mode is SessionMode.CHECK_IN
     assert not transport.closed
 
-    assert app.activate_exercise(analysis(phase=SquatPhase.STANDING)) is True
+    detected = analysis(timestamp_ms=120, phase=SquatPhase.STANDING)
+    assert app.activate_exercise(detected) is False
+    assert app.activate_exercise(analysis(timestamp_ms=130)) is False
+    assert app.coordinator.current_mode is SessionMode.CHECK_IN
+    complete_exact_cue(app, transport, CueId.SQUAT_SET_INTRO, "startup-intro")
+    complete_exact_cue(app, transport, CueId.SQUAT_PERSON_DETECTED, "startup-detected")
+    # Provider completion and PCM release are not speaker completion.
+    assert app.activate_exercise(analysis(timestamp_ms=140)) is False
+    assert app.coordinator.current_mode is SessionMode.CHECK_IN
+    assert app.notify_cue_playback_succeeded(CueId.SQUAT_PERSON_DETECTED)
+    # The last check-in frame cannot be replayed to cross the boundary.
+    assert app.activate_exercise(analysis(timestamp_ms=140)) is False
+    assert app.activate_exercise(analysis(timestamp_ms=150)) is True
     assert app.coordinator.current_mode is SessionMode.ACTIVE_EXERCISE
+
+
+def test_intro_and_one_shot_detection_survive_fast_detection_and_release_fifo() -> None:
+    app, transport, released, _ = build_app()
+
+    assert app.process_analysis(missing_analysis(timestamp_ms=110)).mode is SessionMode.CHECK_IN
+    detected = app.process_analysis(analysis(timestamp_ms=120))
+    repeated = app.process_analysis(analysis(timestamp_ms=130))
+
+    assert detected.mode is SessionMode.CHECK_IN
+    assert repeated.mode is SessionMode.CHECK_IN
+    assert [
+        event["response"]["metadata"]["cue_id"]
+        for event in transport.sent
+        if event["type"] == "response.create"
+    ] == [CueId.SQUAT_SET_INTRO.value]
+    assert app.cue_delivery.snapshot.pending_cue_ids == (CueId.SQUAT_PERSON_DETECTED,)
+
+    complete_exact_cue(app, transport, CueId.SQUAT_SET_INTRO, "fast-intro")
+    assert transport.sent[-1]["response"]["metadata"]["cue_id"] == (
+        CueId.SQUAT_PERSON_DETECTED.value
+    )
+    complete_exact_cue(app, transport, CueId.SQUAT_PERSON_DETECTED, "fast-detected")
+
+    assert [clip.authorization.cue_id for clip in released] == [
+        CueId.SQUAT_SET_INTRO,
+        CueId.SQUAT_PERSON_DETECTED,
+    ]
+    assert app.cue_delivery.snapshot.pending_cue_ids == ()
+    assert app.coordinator.current_mode is SessionMode.CHECK_IN
+    assert app.notify_cue_playback_succeeded(CueId.SQUAT_PERSON_DETECTED)
+    assert app.process_analysis(analysis(timestamp_ms=130)).mode is SessionMode.CHECK_IN
+    assert app.process_analysis(analysis(timestamp_ms=140)).mode is (SessionMode.ACTIVE_EXERCISE)
+    assert not app.notify_cue_playback_succeeded(CueId.SQUAT_PERSON_DETECTED)
+    assert [
+        event["response"]["metadata"]["cue_id"]
+        for event in transport.sent
+        if event["type"] == "response.create"
+    ] == [
+        CueId.SQUAT_SET_INTRO.value,
+        CueId.SQUAT_PERSON_DETECTED.value,
+    ]
+
+
+def test_early_rep_is_rebased_and_cannot_leak_into_first_scripted_count() -> None:
+    app, transport, _, _ = build_app()
+
+    assert not app.activate_exercise(analysis(timestamp_ms=100))
+    early_rep = analysis(
+        timestamp_ms=130,
+        rep_count=1,
+        events=(SquatEvent(SquatEventType.REP_COMPLETED, rep_count=1),),
+    )
+    assert app.process_analysis(early_rep).mode is SessionMode.CHECK_IN
+    complete_exact_cue(app, transport, CueId.SQUAT_SET_INTRO, "early-intro")
+    complete_exact_cue(app, transport, CueId.SQUAT_PERSON_DETECTED, "early-detected")
+    assert app.notify_cue_playback_succeeded(CueId.SQUAT_PERSON_DETECTED)
+    assert app.activate_exercise(analysis(timestamp_ms=160, rep_count=1))
+    assert app.completed_rep_count == 0
+
+    first_after_activation = app.process_analysis(
+        analysis(
+            timestamp_ms=190,
+            rep_count=2,
+            events=(SquatEvent(SquatEventType.REP_COMPLETED, rep_count=2),),
+        )
+    )
+
+    assert first_after_activation.decisions[-1].cue_id == CueId.SQUAT_REP_ONE.value
+    assert app.completed_rep_count == 1
+    assert transport.sent[-1]["response"]["metadata"]["cue_id"] == (CueId.SQUAT_REP_ONE.value)
+
+
+def test_detection_playback_failure_never_arms_activation() -> None:
+    app, transport, _, _ = build_app()
+    assert not app.activate_exercise(analysis(timestamp_ms=100))
+    complete_exact_cue(app, transport, CueId.SQUAT_SET_INTRO, "failure-intro")
+    complete_exact_cue(app, transport, CueId.SQUAT_PERSON_DETECTED, "failure-detected")
+
+    app.report_speaker_failure()
+
+    assert app.coordinator.current_mode is SessionMode.PAUSED
+    assert not app.notify_cue_playback_succeeded(CueId.SQUAT_PERSON_DETECTED)
+    assert not app.realtime_available
+    assert app.completed_rep_count == 0
 
 
 def test_single_camera_observation_is_explicit_and_unassessable_is_not_safe() -> None:
@@ -282,7 +426,7 @@ def test_rep_events_map_to_fixed_catalog_cue_ids(rep_count: int, cue_id: CueId) 
     assert DEFAULT_CUE_CATALOG.is_approved(request.cue_id)
 
 
-def test_rep_and_form_events_reach_guardian_as_typed_cues_not_phrases() -> None:
+def test_rep_events_reach_guardian_and_arm_correction_is_suppressed_during_set() -> None:
     app, transport, _, _ = build_app()
     activate(app)
     rep = analysis(
@@ -303,8 +447,8 @@ def test_rep_and_form_events_reach_guardian_as_typed_cues_not_phrases() -> None:
     assert rep_result.decisions[-1].action is GuardianAction.CUE
     assert rep_result.decisions[-1].cue_id == CueId.SQUAT_REP_ONE.value
     assert GuardianReason.LOCAL_CUE_ACCEPTED in rep_result.decisions[-1].reason_codes
-    assert arms_result.decisions[-1].action is GuardianAction.CUE
-    assert arms_result.decisions[-1].cue_id == CueId.ARMS_T_SHAPE.value
+    assert arms_result.decisions == (arms_result.decisions[0],)
+    assert arms_result.decisions[0].action is GuardianAction.CONTINUE
     assert transport.sent[-1]["type"] == "response.create"
     assert transport.sent[-1]["response"]["metadata"]["cue_id"] == (CueId.SQUAT_REP_ONE.value)
     assert "spoken_text" not in transport.sent[-1]["response"]["metadata"]
@@ -335,6 +479,7 @@ def test_cue_request_network_failure_pauses_but_local_tracking_and_session_conti
     transport = _FailingCueTransport()
     app, _, _, _ = build_app(transport)
     activate(app)
+    transport.fail_cues = True
     rep = analysis(
         rep_count=1,
         events=(SquatEvent(SquatEventType.REP_COMPLETED, rep_count=1),),
@@ -397,6 +542,7 @@ def test_inconsistent_or_replayed_rep_events_pause_without_speaking_wrong_count(
 def test_single_dispatcher_releases_exact_cue_only_after_response_done() -> None:
     app, transport, released, _ = build_app()
     activate(app)
+    released.clear()
     app.process_analysis(
         analysis(
             rep_count=1,
@@ -434,6 +580,7 @@ def test_incomplete_or_mismatched_cue_pauses_without_pcm_or_closing_session(
 ) -> None:
     app, transport, released, _ = build_app()
     activate(app)
+    released.clear()
     app.process_analysis(
         analysis(
             rep_count=1,
@@ -461,11 +608,11 @@ def test_incomplete_or_mismatched_cue_pauses_without_pcm_or_closing_session(
     assert later.mode is SessionMode.PAUSED
 
 
-def test_tenth_rep_does_not_end_or_close_the_long_lived_session() -> None:
+def test_three_rep_script_target_does_not_end_or_close_the_long_lived_session() -> None:
     app, transport, _, _ = build_app()
     activate(app)
 
-    for rep_count in range(1, 11):
+    for rep_count in range(1, 4):
         result = app.process_analysis(
             analysis(
                 timestamp_ms=100 + rep_count * 33,
@@ -474,10 +621,62 @@ def test_tenth_rep_does_not_end_or_close_the_long_lived_session() -> None:
             )
         )
 
-    assert result.decisions[-1].cue_id == CueId.SQUAT_REP_TEN.value
+    assert result.decisions[-1].cue_id == CueId.SQUAT_REP_THREE.value
     assert app.coordinator.current_mode is SessionMode.ACTIVE_EXERCISE
     assert app.ended is False
     assert not transport.closed
+
+
+def test_three_rapid_rep_cues_are_preserved_and_released_fifo() -> None:
+    app, transport, released, _ = build_app()
+    activate(app)
+    released.clear()
+
+    for rep_count in range(1, 4):
+        app.process_analysis(
+            analysis(
+                timestamp_ms=200 + rep_count * 33,
+                rep_count=rep_count,
+                events=(SquatEvent(SquatEventType.REP_COMPLETED, rep_count=rep_count),),
+            )
+        )
+
+    assert app.cue_delivery.snapshot.active_cue_id is CueId.SQUAT_REP_ONE
+    assert app.cue_delivery.snapshot.pending_cue_ids == (
+        CueId.SQUAT_REP_TWO,
+        CueId.SQUAT_REP_THREE,
+    )
+    for rep_count, cue_id in enumerate(SQUAT_REP_CUE_IDS, start=1):
+        assert transport.sent[-1]["response"]["metadata"]["cue_id"] == cue_id.value
+        complete_exact_cue(app, transport, cue_id, f"rep-{rep_count}")
+
+    assert [clip.authorization.cue_id for clip in released] == list(SQUAT_REP_CUE_IDS)
+    assert app.cue_delivery.snapshot.pending_cue_ids == ()
+
+
+def test_control_turn_defers_all_three_rep_cues_fifo() -> None:
+    app, transport, _, _ = build_app()
+    activate(app)
+    assert app.submit_user_audio_turn(PCM).submitted
+
+    for rep_count in range(1, 4):
+        app.process_analysis(
+            analysis(
+                timestamp_ms=300 + rep_count * 33,
+                rep_count=rep_count,
+                events=(SquatEvent(SquatEventType.REP_COMPLETED, rep_count=rep_count),),
+            )
+        )
+
+    transport.incoming.extend((created("control-fifo"), response_done("control-fifo")))
+    app.pump_once()
+    app.pump_once()
+
+    assert app.cue_delivery.snapshot.active_cue_id is CueId.SQUAT_REP_ONE
+    assert app.cue_delivery.snapshot.pending_cue_ids == (
+        CueId.SQUAT_REP_TWO,
+        CueId.SQUAT_REP_THREE,
+    )
 
 
 def test_user_audio_turn_requests_tool_only_response_and_never_ordinary_speech() -> None:
@@ -657,7 +856,8 @@ def test_ordered_writer_keeps_guardian_pause_nonblocking_and_cancellation_ordere
         on_audio_preempt=lambda: None,
     )
     app.start(instructions="Keep this exercise session concise.", voice="marin")
-    activate(app)
+    activate(app, delivery_transport=delegate)
+    delegate.block_cues = True
     app.process_analysis(
         analysis(
             rep_count=1,
@@ -684,11 +884,11 @@ def test_ordered_writer_keeps_guardian_pause_nonblocking_and_cancellation_ordere
         if [event["type"] for event in delegate.sent][-1:] == ["response.cancel"]:
             break
         threading.Event().wait(0.005)
-    assert [event["type"] for event in delegate.sent] == [
-        "session.update",
+    assert [event["type"] for event in delegate.sent][-2:] == [
         "response.create",
         "response.cancel",
     ]
+    assert delegate.sent[-2]["response"]["metadata"]["cue_id"] == (CueId.SQUAT_REP_ONE.value)
     transport.close()
     delegate.release_close.set()
 
@@ -702,7 +902,8 @@ def test_ordered_writer_keeps_physical_stop_nonblocking_during_blocked_send_and_
         on_audio_preempt=lambda: None,
     )
     app.start(instructions="Keep this exercise session concise.", voice="marin")
-    activate(app)
+    activate(app, delivery_transport=delegate)
+    delegate.block_cues = True
     app.process_analysis(
         analysis(
             rep_count=1,
@@ -821,7 +1022,6 @@ def test_ordinary_events_and_receive_failure_do_not_end_controller() -> None:
 
     failing_transport = _FailingReceiveTransport()
     failing_app, _, _, _ = build_app(failing_transport)
-    activate(failing_app)
     failed = failing_app.pump_once()
 
     assert failed.realtime_result is None
