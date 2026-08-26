@@ -551,6 +551,14 @@ def test_deploy_builds_fresh_silent_pi_local_pose_environment() -> None:
     assert "scripts/fetch-pi-pose-ncnn-runtime.sh" in deploy
     assert "scripts/fetch-pi-pose-ncnn-models.sh" in deploy
     assert "scripts/verify-pi-pose-ncnn-assets.sh" in deploy
+    # The Pi mounts the /run deployment stage noexec. Invoke the already
+    # digest-verified shell helper through the trusted system shell.
+    assert deploy.count('/bin/bash "$verifier" "$assets" root:root') == 1
+    assert deploy.count('/bin/bash "$asset_verifier"') == 2
+    assert deploy.count('/bin/bash "$asset_verifier_source"') == 2
+    assert '\n"$verifier" "$assets" root:root' not in deploy
+    assert '\n"$asset_verifier"' not in deploy
+    assert '\n"$asset_verifier_source"' not in deploy
     assert "DevicePolicy=closed" in deploy
     assert 'b"OPENAI_API_KEY" in environment' in deploy
     assert "unset OPENAI_API_KEY" in deploy
@@ -587,7 +595,7 @@ def test_deploy_builds_fresh_silent_pi_local_pose_environment() -> None:
     assert "/dev/video0 rw" in deploy
     assert "SupplementaryGroups 'gpio video'" in deploy
     assert "recoverybox.service LimitCORE 0" in deploy
-    assert '"$asset_verifier_source" "/proc/$pid/root$app_root" root:root' in deploy
+    assert '/bin/bash "$asset_verifier_source" "/proc/$pid/root$app_root" root:root' in deploy
     assert "backups/" not in deploy
     assert "releases/" not in deploy
     assert 'readonly ssh_target="${remote_user}@${pi_ip}"' in deploy
@@ -654,10 +662,10 @@ def test_deploy_binds_staged_and_activated_app_to_fresh_local_tree_digest() -> N
     )
     assert 'mv -- "$asset_stage/runtime" "$root/runtime"' in deploy
     assert 'mv -- "$asset_stage/models" "$root/models"' in deploy
-    assert '"$asset_verifier" "$root" root:root' in deploy
+    assert '/bin/bash "$asset_verifier" "$root" root:root' in deploy
     assert "activated RecoveryBox NCNN runtime/models did not match their exact pins" in deploy
     assert deploy.index(activated_proof) < deploy.index(
-        '"$asset_verifier_source" "$app_root" root:root'
+        '/bin/bash "$asset_verifier_source" "$app_root" root:root'
     )
     assert deploy.index(activated_proof) < deploy.rindex("activated_app_pending=0")
     assert deploy.index(activated_proof) < deploy.rindex("remote_unit_stage_pending=0")
@@ -684,7 +692,9 @@ def test_deploy_binds_staged_and_activated_app_to_fresh_local_tree_digest() -> N
     assert 'proof="$app_root/.runtime-proven-v2"' in deploy
     final_canonical_proof = deploy.rindex('--root "$app" --strict --expect "$expected_app_digest"')
     proc_root_proof = deploy.index('--root "/proc/$pid/root$app"')
-    proc_asset_proof = deploy.index('"$asset_verifier_source" "/proc/$pid/root$app_root" root:root')
+    proc_asset_proof = deploy.index(
+        '/bin/bash "$asset_verifier_source" "/proc/$pid/root$app_root" root:root'
+    )
     assert final_canonical_proof < deploy.index(restart) < proc_root_proof < proc_asset_proof
     assert proc_asset_proof < deploy.index("runtime_proven=1")
     assert proc_asset_proof < deploy.rindex("activated_app_pending=0")
@@ -705,7 +715,7 @@ def test_deploy_runs_bounded_silent_local_pose_acceptance_before_service() -> No
 
     acceptance = "recoverybox.device.pi_pose_v4l2 --max-frames 3"
     restart = "systemctl restart recoverybox.service recoverybox-status.service"
-    process_proof = '"$asset_verifier_source" "/proc/$pid/root$app_root" root:root'
+    process_proof = '/bin/bash "$asset_verifier_source" "/proc/$pid/root$app_root" root:root'
     endpoint = "Tailnet status endpoint failed Pi-local-pose readiness"
 
     assert acceptance in deploy

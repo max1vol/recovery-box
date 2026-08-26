@@ -680,7 +680,7 @@ verifier=$2
 chmod 0755 "$verifier"
 find "$assets" -type d -exec chmod 0755 {} +
 find "$assets" -type f -exec chmod 0644 {} +
-"$verifier" "$assets" root:root
+/bin/bash "$verifier" "$assets" root:root
 REMOTE_VERIFY_ASSET_STAGE
 
 printf 'Writing a new RecoveryBox-only environment with audio disabled.\n'
@@ -881,7 +881,7 @@ PY
 [ "$(sha256sum "$config" | awk '{print $1}')" = "$config_digest" ] || exit 1
 [ "$(sha256sum "$tree_helper" | awk '{print $1}')" = "$tree_helper_digest" ] || exit 1
 [ "$(sha256sum "$asset_verifier" | awk '{print $1}')" = "$asset_verify_digest" ] || exit 1
-"$asset_verifier" "$assets" root:root
+/bin/bash "$asset_verifier" "$assets" root:root
 systemd-analyze verify "$main" "$status"
 REMOTE_VERIFY_UNIT_STAGE
 
@@ -1012,7 +1012,7 @@ if find "$app" ! -user root -print -quit | grep -q .; then exit 1; fi
 if find "$app" \( -type d -o -type f \) -perm /0022 -print -quit | grep -q .; then
     exit 1
 fi
-"$asset_verifier" "$root" root:root
+/bin/bash "$asset_verifier" "$root" root:root
 
 # This is the exact pre-migration RecoveryBox tree. It is destroyed after the
 # new root-owned inodes are canonical; nothing is copied from it or retained.
@@ -1202,7 +1202,7 @@ done
 # the root-only stage. No service-account write descriptor ever existed.
 PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 "$tree_helper_source" \
     --root "$app" --strict --expect "$expected_app_digest" >/dev/null
-"$asset_verifier_source" "$app_root" root:root
+/bin/bash "$asset_verifier_source" "$app_root" root:root
 
 for target in "$main_target" "$status_target"; do
     if [ -e "$target" ] || [ -L "$target" ]; then
@@ -1547,7 +1547,7 @@ PY
 for pid in "$main_pid" "$status_pid"; do
     PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 "$tree_helper_source" \
         --root "/proc/$pid/root$app" --strict --expect "$expected_app_digest" >/dev/null
-    "$asset_verifier_source" "/proc/$pid/root$app_root" root:root
+    /bin/bash "$asset_verifier_source" "/proc/$pid/root$app_root" root:root
 done
 
 for path in \
