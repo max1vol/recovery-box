@@ -556,9 +556,17 @@ def test_deploy_builds_fresh_silent_pi_local_pose_environment() -> None:
     assert deploy.count('/bin/bash "$verifier" "$assets" root:root') == 1
     assert deploy.count('/bin/bash "$asset_verifier"') == 2
     assert deploy.count('/bin/bash "$asset_verifier_source"') == 2
+    assert (
+        '"$admin_target" /bin/bash \\\n'
+        '    "$remote_asset_verify_stage" "$REMOTE_ROOT" root:root'
+    ) in deploy
     assert '\n"$verifier" "$assets" root:root' not in deploy
     assert '\n"$asset_verifier"' not in deploy
     assert '\n"$asset_verifier_source"' not in deploy
+    assert (
+        '"$admin_target" \\\n'
+        '    "$remote_asset_verify_stage" "$REMOTE_ROOT" root:root'
+    ) not in deploy
     assert "DevicePolicy=closed" in deploy
     assert 'b"OPENAI_API_KEY" in environment' in deploy
     assert "unset OPENAI_API_KEY" in deploy

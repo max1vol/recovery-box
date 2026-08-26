@@ -960,7 +960,9 @@ reject_target_or_descendant_mounts() {
     fi
 }
 cleanup_failed_activation() {
-    result=$?
+    result=$1
+    failed_line=$2
+    failed_command=$3
     trap - EXIT
     if [ "$result" -ne 0 ] && [ "$new_root" -eq 1 ] &&
         [ "$root" = /opt/recoverybox ] && [ -d "$root" ] && [ ! -L "$root" ] &&
@@ -971,9 +973,13 @@ cleanup_failed_activation() {
         reject_target_or_descendant_mounts "$root"
         rm -rf --one-file-system -- "$root"
     fi
+    if [ "$result" -ne 0 ]; then
+        printf 'RecoveryBox app activation failed at remote line %s: %s\n' \
+            "$failed_line" "$failed_command" >&2
+    fi
     exit "$result"
 }
-trap cleanup_failed_activation EXIT
+trap 'cleanup_failed_activation "$?" "$LINENO" "$BASH_COMMAND"' EXIT
 [ "$(id -u)" -eq 0 ] || exit 1
 [ "$(tr -d '\n' </etc/machine-id)" = "$expected_machine_id" ] || exit 1
 tailscale ip -4 | grep -Fqx "$expected_ip" || exit 1
@@ -1043,7 +1049,7 @@ if ! ssh "${ssh_options[@]}" "$admin_target" /usr/bin/python3 - \
     <deploy/recoverybox_tree_digest.py >/dev/null; then
     fail "activated RecoveryBox application did not match the trusted local tree digest"
 fi
-if ! ssh "${ssh_options[@]}" "$admin_target" \
+if ! ssh "${ssh_options[@]}" "$admin_target" /bin/bash \
     "$remote_asset_verify_stage" "$REMOTE_ROOT" root:root; then
     fail "activated RecoveryBox NCNN runtime/models did not match their exact pins"
 fi
