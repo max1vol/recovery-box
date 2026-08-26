@@ -1,0 +1,249 @@
+"""Typed values shared by local movement analysis and the safety Guardian."""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from enum import StrEnum
+from numbers import Real
+
+
+class SessionMode(StrEnum):
+    """High-level lifecycle of one local rehabilitation session."""
+
+    IDLE = "idle"
+    CHECK_IN = "check_in"
+    ACTIVE_EXERCISE = "active_exercise"
+    PAUSED = "paused"
+    STOPPED = "stopped"
+    COMPLETE = "complete"
+
+
+class GuardianAction(StrEnum):
+    """Closed set of actions the local safety layer may return."""
+
+    CONTINUE = "continue"
+    CUE = "cue"
+    PAUSE = "pause"
+    STOP = "stop"
+    ESCALATE = "escalate"
+
+
+class GuardianReason(StrEnum):
+    """Auditable reason codes attached to each Guardian decision."""
+
+    WITHIN_LIMITS = "within_limits"
+    EMERGENCY_REPORTED = "emergency_reported"
+    PAIN_REPORTED = "pain_reported"
+    WRONG_EXERCISE = "wrong_exercise"
+    OUT_OF_DISTRIBUTION = "out_of_distribution"
+    STALE_OBSERVATION = "stale_observation"
+    LOW_CONFIDENCE = "low_confidence"
+    MISSING_CAMERA_EVIDENCE = "missing_camera_evidence"
+    CAMERA_DISAGREEMENT = "camera_disagreement"
+    UNKNOWN_CUE = "unknown_cue"
+    CUE_NOT_ALLOWED = "cue_not_allowed"
+    LOCAL_CUE_ACCEPTED = "local_cue_accepted"
+    LOCAL_CUE_IGNORED_FOR_SAFETY = "local_cue_ignored_for_safety"
+    LEARNED_MODEL_CUE_ACCEPTED = "learned_model_cue_accepted"
+    LEARNED_MODEL_INCREASED_CAUTION = "learned_model_increased_caution"
+    LEARNED_MODEL_PRESERVED_CAUTION = "learned_model_preserved_caution"
+    LEARNED_MODEL_SUGGESTION_IGNORED = "learned_model_suggestion_ignored"
+
+
+@dataclass(frozen=True, slots=True)
+class MovementObservation:
+    """One sanitized, pose-derived observation; it contains no image or audio."""
+
+    exercise_id: str
+    timestamp_ms: int
+    confidence: float
+    camera_disagreement_degrees: float | None
+    pose_age_ms: int
+    camera_view_count: int = 2
+    rep_index: int = 0
+    phase: str = "unknown"
+    quality_label: str | None = None
+    pain_reported: bool = False
+    emergency_reported: bool = False
+    wrong_exercise: bool = False
+    out_of_distribution: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.exercise_id, str):
+            raise TypeError("exercise_id must be a string")
+        exercise_id = self.exercise_id.strip()
+        if not isinstance(self.phase, str):
+            raise TypeError("phase must be a string")
+        phase = self.phase.strip()
+        if not exercise_id:
+            raise ValueError("exercise_id must not be empty")
+        _validate_non_negative_integer("timestamp_ms", self.timestamp_ms)
+        _validate_unit_interval("confidence", self.confidence)
+        if self.camera_disagreement_degrees is not None:
+            _validate_degrees(
+                "camera_disagreement_degrees",
+                self.camera_disagreement_degrees,
+            )
+        _validate_non_negative_integer("pose_age_ms", self.pose_age_ms)
+        if (
+            isinstance(self.camera_view_count, bool)
+            or not isinstance(self.camera_view_count, int)
+            or self.camera_view_count < 1
+        ):
+            raise ValueError("camera_view_count must be a positive integer")
+        _validate_non_negative_integer("rep_index", self.rep_index)
+        if not phase:
+            raise ValueError("phase must not be empty")
+        if self.quality_label is not None:
+            if not isinstance(self.quality_label, str):
+                raise TypeError("quality_label must be a string when provided")
+            if not self.quality_label.strip():
+                raise ValueError("quality_label must be non-empty when provided")
+        for field_name in (
+            "pain_reported",
+            "emergency_reported",
+            "wrong_exercise",
+            "out_of_distribution",
+        ):
+            if not isinstance(getattr(self, field_name), bool):
+                raise TypeError(f"{field_name} must be a boolean")
+        object.__setattr__(self, "exercise_id", exercise_id)
+        object.__setattr__(self, "phase", phase)
+        if self.quality_label is not None:
+            object.__setattr__(self, "quality_label", self.quality_label.strip())
+
+
+@dataclass(frozen=True, slots=True)
+class ExercisePlan:
+    """Clinician-configured safety envelope for one prescribed exercise."""
+
+    exercise_id: str
+    allowed_cue_ids: frozenset[str]
+    target_reps: int = 10
+    min_confidence: float = 0.7
+    max_camera_disagreement_degrees: float = 12.0
+    max_pose_age_ms: int = 500
+    required_camera_views: int = 2
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.exercise_id, str):
+            raise TypeError("exercise_id must be a string")
+        exercise_id = self.exercise_id.strip()
+        if not exercise_id:
+            raise ValueError("exercise_id must not be empty")
+        if (
+            isinstance(self.target_reps, bool)
+            or not isinstance(self.target_reps, int)
+            or self.target_reps <= 0
+        ):
+            raise ValueError("target_reps must be positive")
+        _validate_unit_interval("min_confidence", self.min_confidence)
+        _validate_degrees(
+            "max_camera_disagreement_degrees",
+            self.max_camera_disagreement_degrees,
+        )
+        _validate_non_negative_integer("max_pose_age_ms", self.max_pose_age_ms)
+        if (
+            isinstance(self.required_camera_views, bool)
+            or not isinstance(self.required_camera_views, int)
+            or self.required_camera_views < 1
+        ):
+            raise ValueError("required_camera_views must be a positive integer")
+
+        normalized_cues = frozenset(str(cue_id).strip() for cue_id in self.allowed_cue_ids)
+        if "" in normalized_cues:
+            raise ValueError("allowed_cue_ids must not contain empty identifiers")
+        object.__setattr__(self, "exercise_id", exercise_id)
+        object.__setattr__(self, "allowed_cue_ids", normalized_cues)
+
+
+@dataclass(frozen=True, slots=True)
+class LearnedSuggestion:
+    """Untrusted proposal from a learned model, validated by the Guardian."""
+
+    action: GuardianAction
+    cue_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.action, GuardianAction):
+            raise TypeError("action must be a GuardianAction")
+        if self.action is GuardianAction.CUE:
+            if self.cue_id is None or not isinstance(self.cue_id, str) or not self.cue_id.strip():
+                raise ValueError("a cue suggestion requires cue_id")
+            object.__setattr__(self, "cue_id", self.cue_id.strip())
+        elif self.cue_id is not None:
+            raise ValueError("cue_id is only valid for a cue suggestion")
+
+
+@dataclass(frozen=True, slots=True)
+class LocalCueRequest:
+    """Untrusted local exercise event asking the Guardian to select one cue.
+
+    Pose code can report that a deterministic event occurred, but it cannot
+    authorize speech. The Guardian still validates the cue against both the
+    reviewed catalog and the active exercise plan before returning ``CUE``.
+    """
+
+    cue_id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.cue_id, str):
+            raise TypeError("cue_id must be a string")
+        cue_id = self.cue_id.strip()
+        if not cue_id:
+            raise ValueError("cue_id must not be empty")
+        object.__setattr__(self, "cue_id", cue_id)
+
+
+@dataclass(frozen=True, slots=True)
+class GuardianDecision:
+    """Final local action and its machine-readable audit trail."""
+
+    action: GuardianAction
+    reason_codes: tuple[GuardianReason, ...]
+    rule_version: str
+    cue_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.action, GuardianAction):
+            raise TypeError("action must be a GuardianAction")
+        if (
+            type(self.reason_codes) is not tuple
+            or not self.reason_codes
+            or not all(isinstance(reason, GuardianReason) for reason in self.reason_codes)
+        ):
+            raise ValueError("reason_codes must not be empty")
+        if not isinstance(self.rule_version, str) or not self.rule_version.strip():
+            raise ValueError("rule_version must not be empty")
+        if self.action is GuardianAction.CUE:
+            if self.cue_id is None or not isinstance(self.cue_id, str) or not self.cue_id.strip():
+                raise ValueError("a cue decision requires cue_id")
+            object.__setattr__(self, "cue_id", self.cue_id.strip())
+        elif self.cue_id is not None:
+            raise ValueError("cue_id is only valid for a cue decision")
+
+
+def _validate_unit_interval(name: str, value: float) -> None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, Real)
+        or not math.isfinite(value)
+        or not 0.0 <= value <= 1.0
+    ):
+        raise ValueError(f"{name} must be finite and between 0 and 1")
+
+
+def _validate_degrees(name: str, value: float) -> None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, Real)
+        or not math.isfinite(value)
+        or not 0.0 <= value <= 180.0
+    ):
+        raise ValueError(f"{name} must be finite and between 0 and 180 degrees")
+
+
+def _validate_non_negative_integer(name: str, value: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")

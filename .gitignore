@@ -1,0 +1,33 @@
+.DS_Store
+
+# Local configuration and credentials must never be committed.
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+dist/
+build/
+*.egg-info/
+__pycache__/
+*.py[cod]
+
+# Device-local data and generated model artifacts must never be committed.
+data/
+models/
+artifacts/
+*.wav
+*.pcm
+*.raw
+*.fab

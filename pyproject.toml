@@ -1,0 +1,85 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "recoverybox"
+version = "0.1.0"
+description = "Privacy-preserving home rehabilitation prototype"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "RecoveryBox contributors" }]
+dependencies = [
+  "certifi>=2025.1.31",
+  "flwr[simulation]>=1.34.0,<1.35.0",
+  "numpy>=1.26,<3",
+  "websocket-client>=1.8,<2",
+]
+
+[project.optional-dependencies]
+laptop = [
+  # This pair is pinned because MediaPipe 1.0.1 aborts in its Metal helper on
+  # the hackathon Mac, while 0.10.35 is compatible with Python 3.12/arm64.
+  # Install only one OpenCV wheel: both packages export the same `cv2` module.
+  "mediapipe==0.10.35",
+  "opencv-contrib-python==4.14.0.94",
+  "sounddevice==0.5.6",
+]
+dev = [
+  "pytest>=8.3,<9",
+  "pytest-cov>=6,<7",
+  "ruff>=0.11,<1",
+]
+
+[project.scripts]
+recoverybox = "recoverybox.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/recoverybox"]
+
+[tool.flwr.app]
+publisher = "recoverybox"
+fab-format-version = 1
+flwr-version-target = "1.34.0"
+fab-include = [
+  "LICENSE",
+  "src/recoverybox/__init__.py",
+  "src/recoverybox/federation/**/*.py",
+]
+
+[tool.flwr.app.components]
+serverapp = "recoverybox.federation.server_app:app"
+clientapp = "recoverybox.federation.client_app:app"
+
+[tool.flwr.app.config]
+num-server-rounds = 3
+local-epochs = 2
+learning-rate = 0.05
+l2 = 0.0001
+min-fit-clients = 3
+min-available-clients = 3
+num-shares = 3
+reconstruction-threshold = 2
+max-weight = 10000.0
+clipping-range = 8.0
+validation-fraction = 0.2
+sanitized-feature-path-template = "data/demo/client-{partition_id}.jsonl"
+feature-schema-version = "rehab-quality-features/v1"
+exercise-id = "seated-knee-extension"
+label-definition-version = "seated-knee-extension-rep-quality/v1"
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]

@@ -1,0 +1,36 @@
+[agent]
+input = "Which de-identified sessions should I review first, and what trends are visible?"
+session-summaries-json = '''
+[
+  {
+    "session_id": "sess-demo-001",
+    "participant_ref": "anon-a13c82",
+    "session_date": "2026-08-20",
+    "exercise_id": "seated-knee-extension",
+    "prescribed_reps": 10,
+    "completed_reps": 5,
+    "duration_seconds": 188,
+    "quality_score": 0.58,
+    "observation_confidence": 0.91,
+    "pain_reported": false,
+    "stopped_early": true,
+    "safety_flags": [],
+    "model_version": "motion-0.1.0"
+  },
+  {
+    "session_id": "sess-demo-002",
+    "participant_ref": "anon-b70e41",
+    "session_date": "2026-08-21",
+    "exercise_id": "seated-knee-extension",
+    "prescribed_reps": 10,
+    "completed_reps": 3,
+    "duration_seconds": 97,
+    "quality_score": 0.42,
+    "observation_confidence": 0.88,
+    "pain_reported": true,
+    "stopped_early": true,
+    "safety_flags": ["SHARP_PAIN_REPORTED"],
+    "model_version": "motion-0.1.0"
+  }
+]
+'''
