@@ -45,11 +45,13 @@ with your shell or secret manager, then run:
 uv run recoverybox squat-demo
 ```
 
-RecoveryBox does not load `.env` files. The preview is on by default and shows
-the live camera, MediaPipe skeleton, squat count/status, camera-loop FPS and
-capture latency, plus pose-model FPS and inference latency. Press `q` or Escape
-in the preview to stop. On macOS, the launching terminal or app must have
-Camera permission.
+The one-process `squat-demo` does not load `.env` files; export the key in its
+launching shell. The separate `recoverybox-local-prime` test topology accepts
+an explicit private `--env-file` as described in [Max's run instructions](MAX_RUN.md).
+The preview is on by default and shows the live camera, MediaPipe skeleton,
+squat count/status, camera-loop FPS and capture latency, plus pose-model FPS
+and inference latency. Press `q` or Escape in the preview to stop. On macOS,
+the launching terminal or app must have Camera permission.
 
 ## What is implemented
 
@@ -299,6 +301,7 @@ on the pinned operator Mac, load Max's ignored local `.env` into the current
 shell, run the read-only preflight, and only then perform the direct replacement:
 
 ```bash
+chmod 600 .env
 set -a
 . ./.env
 set +a

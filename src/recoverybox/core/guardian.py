@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+
 from recoverybox.core.cues import (
     DEFAULT_CUE_CATALOG,
     SQUAT_SCRIPTED_SESSION_CUE_IDS,
@@ -12,9 +14,12 @@ from recoverybox.core.models import (
     GuardianAction,
     GuardianDecision,
     GuardianReason,
+    GuardianRuntimeFault,
     LearnedSuggestion,
     LocalCueRequest,
     MovementObservation,
+    _is_guardian_decision_issued_by,
+    _issue_guardian_decision,
 )
 
 _ACTION_CAUTION = {
@@ -41,6 +46,10 @@ class Guardian:
             raise ValueError("rule_version must not be empty")
         self._cue_catalog = cue_catalog
         self._rule_version = rule_version.strip()
+        self.__issuer = object()
+        self._issue_lock = threading.Lock()
+        self._latest_sequence = 0
+        self._consumed_activation_sequences: set[int] = set()
 
     @property
     def cue_catalog(self) -> ApprovedCueCatalog:
@@ -49,6 +58,52 @@ class Guardian:
     @property
     def rule_version(self) -> str:
         return self._rule_version
+
+    def issued(self, decision: object) -> bool:
+        """Return whether this exact Guardian instance issued ``decision``."""
+
+        return _is_guardian_decision_issued_by(decision, self.__issuer)
+
+    @property
+    def latest_sequence(self) -> int:
+        """Monotonic sequence of the most recently issued local verdict."""
+
+        with self._issue_lock:
+            return self._latest_sequence
+
+    def consume_activation(self, decision: object) -> bool:
+        """Atomically consume the latest CONTINUE verdict for one activation."""
+
+        with self._issue_lock:
+            if not _is_guardian_decision_issued_by(decision, self.__issuer):
+                return False
+            assert isinstance(decision, GuardianDecision)
+            if (
+                decision.action is not GuardianAction.CONTINUE
+                or decision.sequence != self._latest_sequence
+                or decision.sequence in self._consumed_activation_sequences
+            ):
+                return False
+            self._consumed_activation_sequences.add(decision.sequence)
+            return True
+
+    def _issue(
+        self,
+        *,
+        action: GuardianAction,
+        reason_codes: tuple[GuardianReason, ...],
+        cue_id: str | None = None,
+    ) -> GuardianDecision:
+        with self._issue_lock:
+            self._latest_sequence += 1
+            return _issue_guardian_decision(
+                action=action,
+                cue_id=cue_id,
+                reason_codes=reason_codes,
+                rule_version=self._rule_version,
+                sequence=self._latest_sequence,
+                _issuer=self.__issuer,
+            )
 
     def decide(
         self,
@@ -83,11 +138,10 @@ class Guardian:
         if not reasons:
             reasons.append(GuardianReason.WITHIN_LIMITS)
 
-        return GuardianDecision(
+        return self._issue(
             action=action,
             cue_id=cue_id,
             reason_codes=tuple(reasons),
-            rule_version=self._rule_version,
         )
 
     def decide_scripted_session_cue(
@@ -110,22 +164,51 @@ class Guardian:
 
         cue_id = request.cue_id
         if not self._cue_catalog.is_approved(cue_id):
-            return GuardianDecision(
+            return self._issue(
                 action=GuardianAction.PAUSE,
                 reason_codes=(GuardianReason.UNKNOWN_CUE,),
-                rule_version=self._rule_version,
             )
         if cue_id not in SQUAT_SCRIPTED_SESSION_CUE_IDS or cue_id not in plan.allowed_cue_ids:
-            return GuardianDecision(
+            return self._issue(
                 action=GuardianAction.PAUSE,
                 reason_codes=(GuardianReason.CUE_NOT_ALLOWED,),
-                rule_version=self._rule_version,
             )
-        return GuardianDecision(
+        return self._issue(
             action=GuardianAction.CUE,
             cue_id=cue_id,
             reason_codes=(GuardianReason.LOCAL_CUE_ACCEPTED,),
-            rule_version=self._rule_version,
+        )
+
+    def decide_runtime_fault(self, fault: GuardianRuntimeFault) -> GuardianDecision:
+        """Fail closed for one typed non-camera runtime fault.
+
+        Runtime code reports the fault category but never selects the action.
+        This keeps output/connectivity caution under the same sealed Guardian
+        authority without pretending it came from movement evidence.
+        """
+
+        if not isinstance(fault, GuardianRuntimeFault):
+            raise TypeError("fault must be a GuardianRuntimeFault")
+        reasons = {
+            GuardianRuntimeFault.REALTIME_UNAVAILABLE: (GuardianReason.REALTIME_UNAVAILABLE,),
+            GuardianRuntimeFault.CUE_DELIVERY_UNAVAILABLE: (
+                GuardianReason.CUE_DELIVERY_UNAVAILABLE,
+            ),
+            GuardianRuntimeFault.INHERITED_CAUTION: (GuardianReason.INHERITED_RUNTIME_CAUTION,),
+            GuardianRuntimeFault.RUNTIME_BOUNDARY_FAILURE: (
+                GuardianReason.RUNTIME_BOUNDARY_FAILURE,
+            ),
+            GuardianRuntimeFault.SAFETY_ENFORCEMENT_FAILURE: (
+                GuardianReason.SAFETY_ENFORCEMENT_FAILURE,
+            ),
+        }
+        return self._issue(
+            action=(
+                GuardianAction.ESCALATE
+                if fault is GuardianRuntimeFault.SAFETY_ENFORCEMENT_FAILURE
+                else GuardianAction.PAUSE
+            ),
+            reason_codes=reasons[fault],
         )
 
     def _apply_local_cue_request(

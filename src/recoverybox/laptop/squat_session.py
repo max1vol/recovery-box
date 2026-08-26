@@ -25,6 +25,7 @@ from recoverybox.core import (
     Guardian,
     GuardianAction,
     GuardianDecision,
+    GuardianRuntimeFault,
     LocalCueRequest,
     MovementObservation,
     SessionMode,
@@ -46,6 +47,7 @@ from recoverybox.realtime import (
     RealtimeSession,
     RealtimeTransport,
     ReleasedCueAudio,
+    RuntimeAbortReason,
     ServerEventKind,
     SessionEndController,
     SessionEndSignal,
@@ -343,12 +345,13 @@ class LaptopSquatSession:
             check_in_cue_ids=(CueId.SQUAT_SET_INTRO, CueId.SQUAT_PERSON_DETECTED),
             **delivery_options,  # type: ignore[arg-type]
         )
+        self._end_controller = SessionEndController(self._on_session_end)
         self._coordinator = SessionCoordinator(
+            guardian=self._guardian,
             cue_playback=self._cue_delivery,
-            initial_mode=SessionMode.IDLE,
+            session_end_authority=self._end_controller,
         )
         mode_provider.bind(self._coordinator)
-        self._end_controller = SessionEndController(self._on_session_end)
 
     @property
     def realtime_session(self) -> RealtimeSession:
@@ -431,7 +434,7 @@ class LaptopSquatSession:
                     instructions=session_instructions,
                     voice=voice,
                 )
-                self._coordinator.transition_to(SessionMode.CHECK_IN)
+                self._coordinator.enter_check_in()
                 intro = self._guardian.decide_scripted_session_cue(
                     LocalCueRequest(CueId.SQUAT_SET_INTRO.value),
                     self._plan,
@@ -494,9 +497,7 @@ class LaptopSquatSession:
                 if freshness_threshold is not None and analysis.timestamp_ms <= freshness_threshold:
                     self._remember_check_in_analysis_timestamp_locked(analysis.timestamp_ms)
                     return False
-                self._coordinator.begin_active_exercise_from_check_in()
-            else:
-                self._coordinator.transition_to(SessionMode.ACTIVE_EXERCISE)
+            self._coordinator.activate_after_guardian_continue(decision)
             with self._state_lock:
                 self._last_observed_rep_count = analysis.rep_count
                 self._activation_rep_count = analysis.rep_count
@@ -556,7 +557,7 @@ class LaptopSquatSession:
             decision = self._guardian.decide(observation, self._plan)
             if decision.action is not GuardianAction.CONTINUE:
                 return False
-            self._coordinator.transition_to(SessionMode.ACTIVE_EXERCISE)
+            self._coordinator.activate_after_guardian_continue(decision)
             with self._state_lock:
                 self._last_observed_rep_count = analysis.rep_count
             return True
@@ -848,10 +849,37 @@ class LaptopSquatSession:
 
         return self._end_controller.request_physical_stop()
 
-    def close(self) -> None:
-        """Treat an explicit launcher close as the physical stop boundary."""
+    def abort_runtime(
+        self,
+        reason: RuntimeAbortReason,
+    ) -> SessionEndSignal | None:
+        """Contain runtime teardown without claiming a physical/user stop."""
 
-        self.request_physical_stop()
+        return self._end_controller.request_runtime_abort(reason)
+
+    def apply_runtime_fault(
+        self,
+        fault: GuardianRuntimeFault,
+    ) -> GuardianDecisionEffect:
+        """Route one typed non-camera fault through the local Guardian."""
+
+        self._require_running()
+        return self._coordinator.apply_runtime_fault(fault)
+
+    def pause_for_runtime_fault(
+        self,
+        fault: GuardianRuntimeFault,
+    ) -> GuardianDecisionEffect:
+        """Backward-compatible typed alias for caution-only callers."""
+
+        if fault is GuardianRuntimeFault.SAFETY_ENFORCEMENT_FAILURE:
+            raise ValueError("safety enforcement failure is an escalation, not a pause")
+        return self.apply_runtime_fault(fault)
+
+    def close(self) -> None:
+        """Close explicitly without fabricating physical-stop intent."""
+
+        self.abort_runtime(RuntimeAbortReason.EXPLICIT_CLOSE)
 
     def _on_cue_delivery_failure(self, failure: CueDeliveryFailure) -> None:
         with self._request_lock:
@@ -864,20 +892,20 @@ class LaptopSquatSession:
         if self._coordinator.current_mode is not SessionMode.ACTIVE_EXERCISE:
             return
         try:
-            self._coordinator.transition_to(SessionMode.PAUSED)
+            self._coordinator.apply_runtime_fault(GuardianRuntimeFault.CUE_DELIVERY_UNAVAILABLE)
         except Exception:
             # The coordinator publishes the fail-closed target in a finally
             # block even if an output boundary fails to preempt cleanly.
             pass
 
-    def _on_session_end(self, _: SessionEndSignal) -> None:
+    def _on_session_end(self, signal: SessionEndSignal) -> None:
         with self._request_lock:
             with self._state_lock:
                 if self._closed:
                     return
                 self._closed = True
             try:
-                self._coordinator.transition_to(SessionMode.STOPPED)
+                self._coordinator.apply_session_end(signal)
             finally:
                 try:
                     self._cue_delivery.close()
@@ -962,7 +990,12 @@ class LaptopSquatSession:
             SessionMode.ACTIVE_EXERCISE,
         }:
             try:
-                self._coordinator.transition_to(SessionMode.PAUSED)
+                fault = (
+                    GuardianRuntimeFault.CUE_DELIVERY_UNAVAILABLE
+                    if failure_kind in {"CueDeliveryUnavailable", "SpeakerPlaybackError"}
+                    else GuardianRuntimeFault.REALTIME_UNAVAILABLE
+                )
+                self._coordinator.apply_runtime_fault(fault)
             except Exception:
                 # The target mode is still published by the coordinator.
                 pass

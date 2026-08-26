@@ -11,8 +11,14 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
-from enum import StrEnum
+
+from recoverybox.session_end import (
+    RuntimeAbortReason,
+    SessionEndSignal,
+    SessionEndSource,
+    _is_session_end_signal_issued_by,
+    _issue_session_end_signal,
+)
 
 from .tools import FunctionTool, ToolRegistry, ValidatedToolCall
 
@@ -40,21 +46,6 @@ class SessionControlError(ValueError):
     """An input was not an authorized request to end the session."""
 
 
-class SessionEndSource(StrEnum):
-    """Locally distinguish the two allowed ways a session can end."""
-
-    VALIDATED_TOOL_CALL = "validated_tool_call"
-    PHYSICAL_STOP = "physical_stop"
-
-
-@dataclass(frozen=True, slots=True)
-class SessionEndSignal:
-    """One-shot signal for the composition root to perform device cleanup."""
-
-    source: SessionEndSource
-    tool_call_id: str | None = None
-
-
 class SessionEndController:
     """Turn an explicit, locally authorized request into one end signal.
 
@@ -75,6 +66,7 @@ class SessionEndController:
         self._on_end = on_end
         self._lock = threading.Lock()
         self._end_signal: SessionEndSignal | None = None
+        self.__issuer = object()
 
     @property
     def ended(self) -> bool:
@@ -85,6 +77,11 @@ class SessionEndController:
     def end_signal(self) -> SessionEndSignal | None:
         with self._lock:
             return self._end_signal
+
+    def issued(self, signal: object) -> bool:
+        """Return whether this exact controller issued ``signal``."""
+
+        return _is_session_end_signal_issued_by(signal, self.__issuer)
 
     def accept_validated_tool_call(
         self,
@@ -102,18 +99,42 @@ class SessionEndController:
             raise SessionControlError("finish_session call id must not be blank")
 
         return self._end(
-            SessionEndSignal(
+            _issue_session_end_signal(
                 source=SessionEndSource.VALIDATED_TOOL_CALL,
                 tool_call_id=call.call_id,
+                _issuer=self.__issuer,
             )
         )
 
     def request_physical_stop(self) -> SessionEndSignal | None:
         """End from a locally observed physical stop through the same path."""
 
-        return self._end(SessionEndSignal(source=SessionEndSource.PHYSICAL_STOP))
+        return self._end(
+            _issue_session_end_signal(
+                source=SessionEndSource.PHYSICAL_STOP,
+                _issuer=self.__issuer,
+            )
+        )
+
+    def request_runtime_abort(
+        self,
+        reason: RuntimeAbortReason,
+    ) -> SessionEndSignal | None:
+        """Contain a runtime without claiming a user or physical stop."""
+
+        if not isinstance(reason, RuntimeAbortReason):
+            raise TypeError("reason must be a RuntimeAbortReason")
+        return self._end(
+            _issue_session_end_signal(
+                source=SessionEndSource.RUNTIME_ABORT,
+                abort_reason=reason,
+                _issuer=self.__issuer,
+            )
+        )
 
     def _end(self, signal: SessionEndSignal) -> SessionEndSignal | None:
+        if not self.issued(signal):
+            raise TypeError("signal must be issued by this SessionEndController")
         callback: Callable[[SessionEndSignal], None] | None
         with self._lock:
             if self._end_signal is not None:

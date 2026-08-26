@@ -35,7 +35,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Protocol, TextIO
 
-from recoverybox.core import CueId, SessionMode
+from recoverybox.core import CueId, GuardianRuntimeFault, SessionMode
 from recoverybox.device.audio_process import AlsaCommandConfig, SubprocessPlayback
 from recoverybox.device.gpio_stop import (
     GpioStopConfig,
@@ -53,6 +53,7 @@ from recoverybox.laptop.squat_session import LaptopSquatSession
 from recoverybox.realtime import (
     BoundedOrderedTransport,
     ReleasedCueAudio,
+    RuntimeAbortReason,
     WebSocketJsonTransport,
 )
 from recoverybox.remote_pose import (
@@ -80,6 +81,7 @@ _TAILSCALE_IPV4_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 _REALTIME_CONNECT_TIMEOUT_SECONDS = 5.0
 _GPIO_START_TIMEOUT_SECONDS = 1.0
 _LOCAL_POSE_START_TIMEOUT_SECONDS = 30.0
+_LOCAL_POSE_START_POLL_SECONDS = 0.05
 _LOCAL_POSE_CLEANUP_TIMEOUT_SECONDS = 2.0
 _STATUS_HEARTBEAT_SECONDS = 1.0
 _LOCAL_SESSION_ID = "0" * 32
@@ -428,6 +430,10 @@ class _RemoteSquatSession(Protocol):
     def tick(self) -> int: ...
 
     def request_physical_stop(self) -> object: ...
+
+    def abort_runtime(self, reason: RuntimeAbortReason) -> object: ...
+
+    def apply_runtime_fault(self, fault: GuardianRuntimeFault) -> object: ...
 
 
 class _CueSpeaker(Protocol):
@@ -1129,10 +1135,12 @@ class RemotePoseService:
         self._stop_input_failure_kind: str | None = None
         self._input_terminal = False
         self._stop_request_epoch = 0
+        self._pending_local_physical_stop = False
         self._session: _RemoteSquatSession | None = None
         self._speaker: _CueSpeaker | None = None
         self._session_id: str | None = None
         self._session_terminal = False
+        self._terminal_session_mode: SessionMode | None = None
         self._session_stop_requested = False
         self._retired_session_ids: set[str] = set()
         self._last_sequence = 0
@@ -1165,16 +1173,18 @@ class RemotePoseService:
     def current_mode(self) -> SessionMode | None:
         with self._lock:
             session = self._session
-            terminal = self._session_terminal
-        if terminal:
-            return SessionMode.STOPPED
+            terminal_mode = self._terminal_session_mode
         if session is None:
-            return None
-        try:
-            mode = session.coordinator.current_mode
-            return mode if isinstance(mode, SessionMode) else None
-        except Exception:
-            return None
+            return terminal_mode
+        return _observed_session_mode(session)
+
+    def _record_terminal_mode(self, session: _RemoteSquatSession) -> None:
+        """Retain only the coordinator mode actually observed after containment."""
+
+        observed = _observed_session_mode(session)
+        with self._lock:
+            if self._session is None and self._session_terminal:
+                self._terminal_session_mode = observed
 
     @property
     def last_failure_kind(self) -> str | None:
@@ -1265,6 +1275,17 @@ class RemotePoseService:
                 return
             if (
                 trigger is StopInputTrigger.BUTTON_PRESSED
+                and self.config.pose_source is PoseSourceMode.LOCAL
+                and self._session is None
+            ):
+                # A local session is deliberately installed only after camera,
+                # model, and Guardian startup. Preserve a physical edge across
+                # that whole interval, including a subsequent button release;
+                # otherwise the later session-start epoch snapshot could make
+                # the earlier press look like the baseline.
+                self._pending_local_physical_stop = True
+            if (
+                trigger is StopInputTrigger.BUTTON_PRESSED
                 and self._session_terminal
                 and self._session is None
             ):
@@ -1300,6 +1321,7 @@ class RemotePoseService:
             )
             if session is not None:
                 self._session_terminal = True
+                self._terminal_session_mode = None
                 if self._session_id is not None:
                     self._retired_session_ids.add(self._session_id)
                 self._session = None
@@ -1320,17 +1342,15 @@ class RemotePoseService:
         with self._lifecycle_lock:
             if should_request_stop and session is not None:
                 try:
-                    session.request_physical_stop()
+                    if trigger is StopInputTrigger.BUTTON_PRESSED:
+                        session.request_physical_stop()
+                    else:
+                        session.abort_runtime(RuntimeAbortReason.LOCAL_INPUT_UNAVAILABLE)
                 except Exception:
                     with self._lock:
                         self._failure_kind = "SessionStopError"
-            if session is not None and not _session_ended(session):
-                transition = getattr(session.coordinator, "transition_to", None)
-                if callable(transition):
-                    try:
-                        transition(SessionMode.STOPPED)
-                    except Exception:
-                        pass
+            if session is not None:
+                self._record_terminal_mode(session)
             if speaker is not None:
                 try:
                     speaker.close()
@@ -1462,15 +1482,34 @@ class RemotePoseService:
     def _serve_local_pose_forever(self) -> None:
         """Consume only the newest process-local numeric pose observation."""
 
+        if self._local_startup_stop_pending():
+            return
         worker = _LocalPoseWorker(
             self._dependencies.local_pose_source_factory,
             clock=self._dependencies.clock,
         )
         worker.start()
-        if not worker.wait_ready(_LOCAL_POSE_START_TIMEOUT_SECONDS):
+        if self._local_startup_stop_pending():
+            worker.stop(_LOCAL_POSE_CLEANUP_TIMEOUT_SECONDS)
+            return
+
+        ready_deadline = time.monotonic() + _LOCAL_POSE_START_TIMEOUT_SECONDS
+        ready = False
+        while not ready:
+            remaining = ready_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            ready = worker.wait_ready(min(_LOCAL_POSE_START_POLL_SECONDS, remaining))
+            if self._local_startup_stop_pending():
+                worker.stop(_LOCAL_POSE_CLEANUP_TIMEOUT_SECONDS)
+                return
+        if not ready:
             self._record_fatal_service_failure("LocalPoseStartupTimeout")
             worker.stop(_LOCAL_POSE_CLEANUP_TIMEOUT_SECONDS)
             raise RuntimeError("local pose source startup timed out")
+        if self._local_startup_stop_pending():
+            worker.stop(_LOCAL_POSE_CLEANUP_TIMEOUT_SECONDS)
+            return
         failure_kind = worker.failure_kind
         if failure_kind is not None:
             self._record_fatal_service_failure(failure_kind)
@@ -1565,6 +1604,13 @@ class RemotePoseService:
             stopped = worker.stop(_LOCAL_POSE_CLEANUP_TIMEOUT_SECONDS)
             if not stopped and not self._shutdown.is_set():
                 self._record_fatal_service_failure("LocalPoseShutdownTimeout")
+
+    def _local_startup_stop_pending(self) -> bool:
+        with self._lock:
+            return (
+                self.config.pose_source is PoseSourceMode.LOCAL
+                and self._pending_local_physical_stop
+            )
 
     def _apply_local_analysis(
         self,
@@ -1850,6 +1896,8 @@ class RemotePoseService:
                     and not self._session_stop_requested
                 )
                 self._session_terminal = self._session_terminal or session is not None
+                if session is not None:
+                    self._terminal_session_mode = None
                 if should_request_stop:
                     self._session_stop_requested = True
                 if session is not None:
@@ -1883,17 +1931,12 @@ class RemotePoseService:
             with self._lifecycle_lock:
                 if should_request_stop and session is not None:
                     try:
-                        session.request_physical_stop()
+                        session.abort_runtime(RuntimeAbortReason.SERVICE_SHUTDOWN)
                     except Exception:
                         with self._lock:
                             self._failure_kind = "SessionStopError"
-                    if not _session_ended(session):
-                        transition = getattr(session.coordinator, "transition_to", None)
-                        if callable(transition):
-                            try:
-                                transition(SessionMode.STOPPED)
-                            except Exception:
-                                pass
+                if session is not None:
+                    self._record_terminal_mode(session)
                 if speaker is not None:
                     try:
                         speaker.close()
@@ -1947,6 +1990,10 @@ class RemotePoseService:
             start_stop_epoch = self._stop_request_epoch
             monitor_started = self._stop_monitor_started
             input_terminal = self._input_terminal
+            pending_local_physical_stop = (
+                self.config.pose_source is PoseSourceMode.LOCAL
+                and self._pending_local_physical_stop
+            )
         if current_session is not None and current_id != message.session_id:
             try:
                 inherit_pause = current_session.coordinator.current_mode is SessionMode.PAUSED
@@ -1954,6 +2001,8 @@ class RemotePoseService:
                 inherit_pause = True
         else:
             inherit_pause = False
+        if pending_local_physical_stop:
+            raise _ConnectionRejected("PhysicalStop")
         if not monitor_started or input_terminal:
             raise _ConnectionRejected("PhysicalStopUnavailable")
         if current_id == message.session_id:
@@ -1980,10 +2029,7 @@ class RemotePoseService:
                 voice=self.config.realtime_voice,
             )
             if inherit_pause:
-                transition = getattr(session.coordinator, "transition_to", None)
-                if not callable(transition):
-                    raise RuntimeError("new session cannot inherit pause")
-                transition(SessionMode.PAUSED)
+                session.apply_runtime_fault(GuardianRuntimeFault.INHERITED_CAUTION)
         except Exception:
             _quiesce_speaker(speaker)
             try:
@@ -1991,7 +2037,7 @@ class RemotePoseService:
             except Exception:
                 pass
             try:
-                session.request_physical_stop()
+                session.abort_runtime(RuntimeAbortReason.STARTUP_FAILURE)
             except Exception:
                 pass
             try:
@@ -2006,10 +2052,7 @@ class RemotePoseService:
                         voice=self.config.realtime_voice,
                     )
                     if inherit_pause:
-                        transition = getattr(session.coordinator, "transition_to", None)
-                        if not callable(transition):
-                            raise RuntimeError("new session cannot inherit pause")
-                        transition(SessionMode.PAUSED)
+                        session.apply_runtime_fault(GuardianRuntimeFault.INHERITED_CAUTION)
                 except Exception:
                     _quiesce_speaker(speaker)
                     try:
@@ -2017,7 +2060,7 @@ class RemotePoseService:
                     except Exception:
                         pass
                     try:
-                        session.request_physical_stop()
+                        session.abort_runtime(RuntimeAbortReason.STARTUP_FAILURE)
                     except Exception:
                         pass
                     try:
@@ -2031,14 +2074,21 @@ class RemotePoseService:
                 raise _ConnectionRejected("SessionStartError") from None
 
         with self._lock:
+            interrupted_by_physical_stop = (
+                self.config.pose_source is PoseSourceMode.LOCAL
+                and self._pending_local_physical_stop
+            )
             interrupted_by_local_stop = (
-                self._input_terminal or self._stop_request_epoch != start_stop_epoch
+                self._input_terminal
+                or self._stop_request_epoch != start_stop_epoch
+                or interrupted_by_physical_stop
             )
             if not interrupted_by_local_stop:
                 self._session = session
                 self._speaker = speaker
                 self._session_id = message.session_id
                 self._session_terminal = False
+                self._terminal_session_mode = None
                 self._session_stop_requested = False
                 self._last_sequence = 0
                 self._last_message_digest = None
@@ -2060,7 +2110,10 @@ class RemotePoseService:
             except Exception:
                 pass
             try:
-                session.request_physical_stop()
+                if interrupted_by_physical_stop:
+                    session.request_physical_stop()
+                else:
+                    session.abort_runtime(RuntimeAbortReason.LOCAL_INPUT_UNAVAILABLE)
             except Exception:
                 pass
             try:
@@ -2163,6 +2216,7 @@ class RemotePoseService:
                 speaker = self._speaker
                 _quiesce_speaker(speaker)
                 self._session_terminal = True
+                self._terminal_session_mode = None
                 should_request_stop = not self._session_stop_requested
                 self._session_stop_requested = True
                 if self._session_id is not None:
@@ -2176,20 +2230,15 @@ class RemotePoseService:
                     pass
             if should_request_stop:
                 try:
-                    session.request_physical_stop()
+                    session.abort_runtime(RuntimeAbortReason.REMOTE_STOP)
                 except Exception:
-                    # The one-shot stop signal is committed before cleanup inside
-                    # LaptopSquatSession. Never retry or weaken that boundary.
+                    # A runtime abort commits its one-shot signal before cleanup.
+                    # Never retry it as a forged physical stop.
                     pass
             if not _session_ended(session):
                 with self._lock:
                     self._failure_kind = "SessionStopError"
-                transition = getattr(session.coordinator, "transition_to", None)
-                if callable(transition):
-                    try:
-                        transition(SessionMode.STOPPED)
-                    except Exception:
-                        pass
+            self._record_terminal_mode(session)
             if speaker is not None:
                 try:
                     speaker.close()
@@ -2309,6 +2358,7 @@ class RemotePoseService:
             with self._lock:
                 if session is self._session:
                     self._session_terminal = True
+                    self._terminal_session_mode = _observed_session_mode(session)
         self._sync_voice_failure(session)
         self._publish_status()
 
@@ -2419,11 +2469,12 @@ class RemotePoseService:
         self._publish_status()
 
     def _stop_after_pause_failure(self, session: _RemoteSquatSession) -> None:
-        """Escalate a failed Guardian-pause application to the local stop edge."""
+        """Ask Guardian to escalate, then contain the failed runtime."""
 
         with self._lock:
             if session is self._session:
                 self._session_terminal = True
+                self._terminal_session_mode = None
                 if self._voice_state == "connected":
                     self._voice_state = "silent"
                 should_request_stop = not self._session_stop_requested
@@ -2444,16 +2495,15 @@ class RemotePoseService:
                 pass
         if should_request_stop:
             try:
-                session.request_physical_stop()
+                session.apply_runtime_fault(GuardianRuntimeFault.SAFETY_ENFORCEMENT_FAILURE)
             except Exception:
                 pass
-        if not _session_ended(session):
-            transition = getattr(session.coordinator, "transition_to", None)
-            if callable(transition):
-                try:
-                    transition(SessionMode.STOPPED)
-                except Exception:
-                    pass
+            try:
+                session.abort_runtime(RuntimeAbortReason.SAFETY_ENFORCEMENT_FAILURE)
+            except Exception:
+                pass
+        if session is not None:
+            self._record_terminal_mode(session)
         if speaker is not None:
             try:
                 speaker.close()
@@ -2532,6 +2582,7 @@ class RemotePoseService:
             self._session = None
             self._speaker = None
             self._session_terminal = False
+            self._terminal_session_mode = None
             self._session_stop_requested = False
         if speaker is not None:
             try:
@@ -2545,7 +2596,7 @@ class RemotePoseService:
             and not _session_ended(session)
         ):
             try:
-                session.request_physical_stop()
+                session.abort_runtime(RuntimeAbortReason.SESSION_REPLACED)
             except Exception:
                 pass
         if speaker is not None:
@@ -2688,7 +2739,7 @@ class RemotePoseService:
                     pass
             if replacement is not None:
                 try:
-                    replacement.request_physical_stop()
+                    replacement.abort_runtime(RuntimeAbortReason.STARTUP_FAILURE)
                 except Exception:
                     pass
             if silent_speaker is not None:
@@ -2727,7 +2778,7 @@ class RemotePoseService:
         if not keep_replacement:
             _quiesce_speaker(silent_speaker)
             try:
-                replacement.request_physical_stop()
+                replacement.abort_runtime(RuntimeAbortReason.SESSION_REPLACED)
             except Exception:
                 pass
             try:
@@ -2736,7 +2787,7 @@ class RemotePoseService:
                 pass
             return False
         try:
-            failed_session.request_physical_stop()
+            failed_session.abort_runtime(RuntimeAbortReason.SESSION_REPLACED)
         except Exception:
             pass
         if old_speaker is not None:
@@ -2806,20 +2857,10 @@ class RemotePoseService:
 
     def _publish_status_locked(self, *, force: bool = False) -> None:
         session = self._session
-        try:
-            if session is None:
-                mode = (
-                    SessionMode.STOPPED.value
-                    if self._session_terminal and self._session_id is not None
-                    else None
-                )
-            elif self._session_terminal:
-                mode = SessionMode.STOPPED.value
-            else:
-                current_mode = session.coordinator.current_mode
-                mode = current_mode.value if isinstance(current_mode, SessionMode) else None
-        except Exception:
-            mode = None
+        observed_mode = (
+            self._terminal_session_mode if session is None else _observed_session_mode(session)
+        )
+        mode = observed_mode.value if observed_mode is not None else None
         rep_count = 0 if self._last_analysis is None else self._last_analysis.rep_count
         status: dict[str, object] = {
             "service": self._service_state,
@@ -2844,6 +2885,16 @@ def _session_ended(session: _RemoteSquatSession) -> bool:
         }
     except Exception:
         return True
+
+
+def _observed_session_mode(session: _RemoteSquatSession) -> SessionMode | None:
+    """Read the coordinator's actual product mode without synthesizing one."""
+
+    try:
+        mode = session.coordinator.current_mode
+    except Exception:
+        return None
+    return mode if isinstance(mode, SessionMode) else None
 
 
 def _peer_host(address: object) -> str:

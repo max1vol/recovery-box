@@ -48,6 +48,21 @@ class GuardianReason(StrEnum):
     LEARNED_MODEL_INCREASED_CAUTION = "learned_model_increased_caution"
     LEARNED_MODEL_PRESERVED_CAUTION = "learned_model_preserved_caution"
     LEARNED_MODEL_SUGGESTION_IGNORED = "learned_model_suggestion_ignored"
+    REALTIME_UNAVAILABLE = "realtime_unavailable"
+    CUE_DELIVERY_UNAVAILABLE = "cue_delivery_unavailable"
+    INHERITED_RUNTIME_CAUTION = "inherited_runtime_caution"
+    RUNTIME_BOUNDARY_FAILURE = "runtime_boundary_failure"
+    SAFETY_ENFORCEMENT_FAILURE = "safety_enforcement_failure"
+
+
+class GuardianRuntimeFault(StrEnum):
+    """Closed runtime-fault vocabulary arbitrated by the local Guardian."""
+
+    REALTIME_UNAVAILABLE = "realtime_unavailable"
+    CUE_DELIVERY_UNAVAILABLE = "cue_delivery_unavailable"
+    INHERITED_CAUTION = "inherited_caution"
+    RUNTIME_BOUNDARY_FAILURE = "runtime_boundary_failure"
+    SAFETY_ENFORCEMENT_FAILURE = "safety_enforcement_failure"
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,14 +212,48 @@ class LocalCueRequest:
         object.__setattr__(self, "cue_id", cue_id)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class GuardianDecision:
-    """Final local action and its machine-readable audit trail."""
+    """Sealed final local action and its machine-readable audit trail.
+
+    Only :class:`recoverybox.core.guardian.Guardian` issues instances.  The
+    public constructor is deliberately closed so application code cannot turn
+    an arbitrary enum value into safety authority.
+    """
 
     action: GuardianAction
     reason_codes: tuple[GuardianReason, ...]
     rule_version: str
+    sequence: int
     cue_id: str | None = None
+    _issuer: object
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise TypeError("GuardianDecision can only be issued by Guardian")
+
+    @classmethod
+    def _issue(
+        cls,
+        *,
+        action: GuardianAction,
+        reason_codes: tuple[GuardianReason, ...],
+        rule_version: str,
+        sequence: int,
+        cue_id: str | None = None,
+        _issuer: object,
+    ) -> GuardianDecision:
+        if _issuer is None:
+            raise TypeError("GuardianDecision can only be issued by Guardian")
+        decision = object.__new__(cls)
+        object.__setattr__(decision, "action", action)
+        object.__setattr__(decision, "reason_codes", reason_codes)
+        object.__setattr__(decision, "rule_version", rule_version)
+        object.__setattr__(decision, "sequence", sequence)
+        object.__setattr__(decision, "cue_id", cue_id)
+        object.__setattr__(decision, "_issuer", _issuer)
+        decision.__post_init__()
+        return decision
 
     def __post_init__(self) -> None:
         if not isinstance(self.action, GuardianAction):
@@ -217,12 +266,43 @@ class GuardianDecision:
             raise ValueError("reason_codes must not be empty")
         if not isinstance(self.rule_version, str) or not self.rule_version.strip():
             raise ValueError("rule_version must not be empty")
+        if isinstance(self.sequence, bool) or not isinstance(self.sequence, int):
+            raise TypeError("sequence must be an integer")
+        if self.sequence < 1:
+            raise ValueError("sequence must be positive")
         if self.action is GuardianAction.CUE:
             if self.cue_id is None or not isinstance(self.cue_id, str) or not self.cue_id.strip():
                 raise ValueError("a cue decision requires cue_id")
             object.__setattr__(self, "cue_id", self.cue_id.strip())
         elif self.cue_id is not None:
             raise ValueError("cue_id is only valid for a cue decision")
+
+
+def _issue_guardian_decision(
+    *,
+    action: GuardianAction,
+    reason_codes: tuple[GuardianReason, ...],
+    rule_version: str,
+    sequence: int,
+    cue_id: str | None = None,
+    _issuer: object,
+) -> GuardianDecision:
+    """Issue one sealed verdict for the Guardian implementation only."""
+
+    return GuardianDecision._issue(
+        action=action,
+        reason_codes=reason_codes,
+        rule_version=rule_version,
+        sequence=sequence,
+        cue_id=cue_id,
+        _issuer=_issuer,
+    )
+
+
+def _is_guardian_decision_issued_by(value: object, issuer: object) -> bool:
+    """Return whether ``value`` carries one Guardian instance's authority."""
+
+    return isinstance(value, GuardianDecision) and getattr(value, "_issuer", None) is issuer
 
 
 def _validate_unit_interval(name: str, value: float) -> None:

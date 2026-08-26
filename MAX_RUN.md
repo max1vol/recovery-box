@@ -16,6 +16,7 @@ uv run recoverybox download-pose-model
 Put `OPENAI_API_KEY=...` in `.env`, load it into the launching shell, then run:
 
 ```bash
+chmod 600 .env
 set -a
 . ./.env
 set +a
@@ -45,7 +46,7 @@ Create one temporary authentication token:
 ```bash
 umask 077
 openssl rand -hex 32 > /tmp/recoverybox-pose-token.hex
-tailscale ip -4
+/Applications/Tailscale.app/Contents/MacOS/Tailscale ip -4
 ```
 
 Use the printed Mac Tailscale IPv4 in both terminals. In terminal 1:
@@ -77,6 +78,11 @@ deterministic Guardian, and BCM23 stop handling locally. It does not send raw
 camera frames to the Mac. Tonight's deployment profile is deliberately silent:
 it does not open `/dev/snd` or speak in London.
 
+With the Pi powered off, wire one normally-open momentary stop switch directly
+between physical pin 16 (`BCM23`) and physical pin 14 (`GND`). Do not connect
+the switch to an external voltage; RecoveryBox requests the GPIO's pull-up and
+treats a closed switch as the active-low stop signal.
+
 Read the exact irreversible-deployment and physical-acceptance procedure before
 running it:
 
@@ -90,21 +96,27 @@ ssh root@100.106.237.106 'vcgencmd get_throttled'
 scripts/deploy-pi3.sh
 ```
 
-After a fresh reboot, `get_throttled` must report `0x0`. If its low bits are
-non-zero—especially a result ending in `5`—replace or reseat the Pi power
+The low hexadecimal nibble is the current power state and must be zero. A
+result such as `0xd0000` contains historical flags only and passes with a
+warning; `0xd0005` has active flags `0x5` and fails. After a fresh reboot,
+prefer `0x0`. If the low nibble is non-zero, replace or reseat the Pi power
 supply/cable before continuing; active undervoltage/throttling can make pose
 evidence miss the Guardian's fixed 500 ms deadline and can drop SSH entirely.
-Do not increase that safety deadline.
+Do not increase that safety deadline. The deployment script independently
+requires three clear samples before replacement and again around live pose
+acceptance.
 
 Only after power and the read-only preflight both pass, load `.env` into the
 current shell and apply the direct replacement:
 
 ```bash
+chmod 600 .env
 set -a
 . ./.env
 set +a
 scripts/deploy-pi3.sh --apply
 curl --fail http://100.106.237.106:45874/healthz
+unset OPENAI_API_KEY
 ```
 
 `--apply` permanently removes the named old assistant deployment and installs

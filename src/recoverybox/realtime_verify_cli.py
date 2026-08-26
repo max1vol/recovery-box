@@ -13,9 +13,8 @@ from recoverybox.core import (
     Guardian,
     LocalCueRequest,
     MovementObservation,
-    SessionMode,
 )
-from recoverybox.realtime import RealtimeSession, WebSocketJsonTransport
+from recoverybox.realtime import RealtimeSession, SessionEndController, WebSocketJsonTransport
 from recoverybox.realtime.session_control import SESSION_CONTROL_TOOL_REGISTRY
 from recoverybox.realtime.verification import (
     CueVerificationRequest,
@@ -78,10 +77,13 @@ def build_simulated_squat_authorizations() -> tuple[ApprovedCuePlaybackAuthoriza
         required_camera_views=1,
     )
     collector = _AuthorizationCollector()
+    end_controller = SessionEndController()
     coordinator = SessionCoordinator(
+        guardian=guardian,
         cue_playback=collector,
-        initial_mode=SessionMode.CHECK_IN,
+        session_end_authority=end_controller,
     )
+    coordinator.enter_check_in()
 
     intro = guardian.decide_scripted_session_cue(
         LocalCueRequest(CueId.SQUAT_SET_INTRO.value),
@@ -106,7 +108,8 @@ def build_simulated_squat_authorizations() -> tuple[ApprovedCuePlaybackAuthoriza
         plan,
     )
     coordinator.apply_guardian_decision(detected)
-    coordinator.begin_active_exercise_from_check_in()
+    activation_decision = guardian.decide(first_stand, plan)
+    coordinator.activate_after_guardian_continue(activation_decision)
 
     for rep_index, cue_id in enumerate(
         (

@@ -15,6 +15,7 @@ from recoverybox.core import (
     CueId,
     CueKind,
     GuardianReason,
+    GuardianRuntimeFault,
     SessionMode,
 )
 from recoverybox.device.gpio_stop import (
@@ -41,7 +42,7 @@ from recoverybox.exercise import (
     SquatAssessmentIssue,
     SquatPhase,
 )
-from recoverybox.realtime import ReleasedCueAudio
+from recoverybox.realtime import ReleasedCueAudio, RuntimeAbortReason
 from recoverybox.remote_pose import (
     RemotePoseKind,
     RemotePoseMessage,
@@ -270,6 +271,9 @@ class FakeSession:
         self.processed: list[tuple[SquatAnalysis, int]] = []
         self.ticks = 0
         self.stop_requests = 0
+        self.physical_stop_requests = 0
+        self.abort_requests: list[RuntimeAbortReason] = []
+        self.runtime_faults: list[GuardianRuntimeFault] = []
         self.realtime_failure_kind: str | None = None
 
     def start(self, *, instructions: str, voice: str) -> None:
@@ -328,8 +332,27 @@ class FakeSession:
 
     def request_physical_stop(self) -> object:
         self.stop_requests += 1
+        self.physical_stop_requests += 1
         self.ended = True
         self.coordinator.current_mode = SessionMode.STOPPED
+        self.preempt()
+        return object()
+
+    def abort_runtime(self, reason: RuntimeAbortReason) -> object:
+        self.stop_requests += 1
+        self.abort_requests.append(reason)
+        self.ended = True
+        self.coordinator.current_mode = SessionMode.STOPPED
+        self.preempt()
+        return object()
+
+    def apply_runtime_fault(self, fault: GuardianRuntimeFault) -> object:
+        self.runtime_faults.append(fault)
+        self.coordinator.current_mode = (
+            SessionMode.STOPPED
+            if fault is GuardianRuntimeFault.SAFETY_ENFORCEMENT_FAILURE
+            else SessionMode.PAUSED
+        )
         self.preempt()
         return object()
 
@@ -785,6 +808,179 @@ def test_local_button_stop_allows_bounded_native_read_cleanup(tmp_path: Path) ->
     assert status["service"] == "stopped"
 
 
+def test_local_button_during_blocked_source_open_latches_across_release(
+    tmp_path: Path,
+) -> None:
+    open_started = threading.Event()
+    release_open = threading.Event()
+    monitors: list[FakeStopMonitor] = []
+    sessions: list[FakeSession] = []
+
+    class BlockingOpenSource(FakeLocalPoseSource):
+        def open(self) -> None:
+            open_started.set()
+            assert release_open.wait(2)
+            super().open()
+
+    source = BlockingOpenSource(lambda _: analysis(100))
+
+    def stop_monitor_factory(*, config, on_stop, on_status) -> FakeStopMonitor:
+        monitor = FakeStopMonitor(config=config, on_stop=on_stop, on_status=on_status)
+        monitors.append(monitor)
+        return monitor
+
+    def session_factory(*, api_key, on_cue_audio, on_audio_preempt) -> FakeSession:
+        del api_key, on_cue_audio
+        session = FakeSession(preempt=on_audio_preempt)
+        sessions.append(session)
+        return session
+
+    config = RemotePoseServiceConfig(
+        bind_host="100.106.237.106",
+        allowed_peer="100.70.100.93",
+        token_file=tmp_path / "unused-token",
+        pose_source=PoseSourceMode.LOCAL,
+        status_path=tmp_path / "status.json",
+    )
+    service = RemotePoseService(
+        config,
+        token=None,
+        dependencies=service_dependencies(
+            session_factory=session_factory,
+            credential_provider=lambda: None,
+            stop_monitor_factory=stop_monitor_factory,
+            local_pose_source_factory=lambda: source,
+        ),
+    )
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            service.serve_forever()
+        except BaseException as exc:  # pragma: no branch - diagnostic capture
+            errors.append(exc)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    assert open_started.wait(1)
+    assert monitors
+
+    monitors[0].press()
+    monitors[0].set_status(StopInputState.AVAILABLE)
+    release_open.set()
+    thread.join(2)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert sessions == []
+    assert source.opened and source.closed
+    assert monitors[0].closed
+    assert service.session_id is None
+    status = json.loads(config.status_path.read_text())
+    assert status["service"] == "stopped"
+    assert status["failure"] == "PhysicalStop"
+
+
+def test_local_button_during_session_start_prevents_candidate_install(
+    tmp_path: Path,
+) -> None:
+    session_start_blocked = threading.Event()
+    release_session_start = threading.Event()
+    source_read_blocked = threading.Event()
+    release_source_read = threading.Event()
+    monitors: list[FakeStopMonitor] = []
+    sessions: list[FakeSession] = []
+    speakers: list[FakeSpeaker] = []
+
+    def read_pose(_: int) -> SquatAnalysis:
+        source_read_blocked.set()
+        assert release_source_read.wait(2)
+        return analysis(100)
+
+    source = FakeLocalPoseSource(read_pose)
+
+    class BlockingStartSession(FakeSession):
+        def start(self, *, instructions: str, voice: str) -> None:
+            super().start(instructions=instructions, voice=voice)
+            session_start_blocked.set()
+            assert release_session_start.wait(2)
+
+    def session_factory(*, api_key, on_cue_audio, on_audio_preempt) -> FakeSession:
+        del api_key, on_cue_audio
+        session = BlockingStartSession(preempt=on_audio_preempt)
+        sessions.append(session)
+        return session
+
+    def speaker_factory(config) -> FakeSpeaker:
+        del config
+        speaker = FakeSpeaker()
+        speakers.append(speaker)
+        return speaker
+
+    def stop_monitor_factory(*, config, on_stop, on_status) -> FakeStopMonitor:
+        monitor = FakeStopMonitor(config=config, on_stop=on_stop, on_status=on_status)
+        monitors.append(monitor)
+        return monitor
+
+    config = RemotePoseServiceConfig(
+        bind_host="100.106.237.106",
+        allowed_peer="100.70.100.93",
+        token_file=tmp_path / "unused-token",
+        pose_source=PoseSourceMode.LOCAL,
+        status_path=tmp_path / "status.json",
+        audio_enabled=True,
+    )
+    service = RemotePoseService(
+        config,
+        token=None,
+        dependencies=service_dependencies(
+            session_factory=session_factory,
+            speaker_factory=speaker_factory,
+            credential_provider=lambda: "test-api-key",
+            stop_monitor_factory=stop_monitor_factory,
+            local_pose_source_factory=lambda: source,
+        ),
+    )
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            service.serve_forever()
+        except BaseException as exc:  # pragma: no branch - diagnostic capture
+            errors.append(exc)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    assert session_start_blocked.wait(1)
+    assert source_read_blocked.wait(1)
+    assert monitors
+
+    press_thread = threading.Thread(target=monitors[0].press)
+    press_thread.start()
+    try:
+        assert wait_until(lambda: service.last_failure_kind == "PhysicalStop")
+        monitors[0].set_status(StopInputState.AVAILABLE)
+    finally:
+        release_session_start.set()
+        release_source_read.set()
+    press_thread.join(2)
+    thread.join(2)
+
+    assert not press_thread.is_alive()
+    assert not thread.is_alive()
+    assert errors == []
+    assert len(sessions) == 1
+    assert sessions[0].stop_requests == 1
+    assert len(speakers) == 1
+    assert speakers[0].quiesced and speakers[0].closed
+    assert speakers[0].preemptions >= 1
+    assert source.closed
+    assert service.session_id is None
+    status = json.loads(config.status_path.read_text())
+    assert status["service"] == "stopped"
+    assert status["failure"] == "PhysicalStop"
+
+
 def test_local_session_failure_is_scrubbed_and_marked_fatal(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -895,8 +1091,8 @@ def test_local_voice_failure_during_detection_restores_one_silent_activation_arm
             assert detection_requested.wait(1)
             return SimpleNamespace(failure_kind="ProviderUnavailable", end_signal=None)
 
-        def request_physical_stop(self) -> object:
-            result = super().request_physical_stop()
+        def abort_runtime(self, reason: RuntimeAbortReason) -> object:
+            result = super().abort_runtime(reason)
             failed_session_stopped.set()
             return result
 
@@ -1180,7 +1376,8 @@ def test_local_button_stop_precedes_a_currently_processing_pose(
 
     stop_thread = threading.Thread(target=monitors[0].press)
     stop_thread.start()
-    assert wait_until(lambda: service.current_mode is SessionMode.STOPPED)
+    assert wait_until(lambda: service.last_failure_kind == "PhysicalStop")
+    assert service.current_mode is None
     release_processing.set()
     release_source.set()
     stop_thread.join(1)
@@ -1189,6 +1386,7 @@ def test_local_button_stop_precedes_a_currently_processing_pose(
     assert not stop_thread.is_alive()
     assert not service_thread.is_alive()
     assert service_errors == []
+    assert service.current_mode is SessionMode.STOPPED
     session = sessions[0]
     assert len(session.processed) == 1
     assert session.stop_requests == 1
@@ -2224,7 +2422,9 @@ def test_local_pose_forces_heartbeat_while_status_is_unchanged(tmp_path: Path) -
     assert service.forced_publications == 2
 
 
-def test_timeout_processing_failure_escalates_to_physical_stop(tmp_path: Path) -> None:
+def test_timeout_processing_failure_uses_guardian_escalation_then_runtime_abort(
+    tmp_path: Path,
+) -> None:
     clock = FakeClock()
     sessions: list[FakeSession] = []
 
@@ -2287,6 +2487,9 @@ def test_timeout_processing_failure_escalates_to_physical_stop(tmp_path: Path) -
 
     assert sessions[0].ended
     assert sessions[0].coordinator.current_mode is SessionMode.STOPPED
+    assert sessions[0].runtime_faults == [GuardianRuntimeFault.SAFETY_ENFORCEMENT_FAILURE]
+    assert sessions[0].abort_requests == [RuntimeAbortReason.SAFETY_ENFORCEMENT_FAILURE]
+    assert sessions[0].physical_stop_requests == 0
     status_text = config.status_path.read_text()
     assert "SessionProcessingError" in status_text
     assert "secret processing detail" not in status_text
@@ -2659,7 +2862,7 @@ def test_gpio_failure_status_cannot_expose_exception_content(tmp_path: Path) -> 
     assert json.loads(status_text)["failure"] == "GPIOInputUnavailable"
 
 
-def test_local_stop_detaches_even_when_session_stop_raises(tmp_path: Path) -> None:
+def test_local_stop_failure_does_not_synthesize_stopped_mode(tmp_path: Path) -> None:
     sessions: list[FakeSession] = []
     speakers: list[FakeSpeaker] = []
     monitors: list[FakeStopMonitor] = []
@@ -2723,9 +2926,11 @@ def test_local_stop_detaches_even_when_session_stop_raises(tmp_path: Path) -> No
     assert sessions[0].stop_requests == 1
     assert speakers[0].preemptions >= 1
     assert speakers[0].closed
-    assert service.current_mode is SessionMode.STOPPED
+    assert service.current_mode is SessionMode.IDLE
     status_text = config.status_path.read_text()
     assert "SessionStopError" in status_text
+    assert '"mode":"idle"' in status_text
+    assert '"mode":"stopped"' not in status_text
     assert "private stop failure" not in status_text
 
 
@@ -2734,9 +2939,9 @@ def test_monitor_closes_before_shutdown_requests_session_stop(tmp_path: Path) ->
     sessions: list[FakeSession] = []
 
     class OrderedStopSession(FakeSession):
-        def request_physical_stop(self) -> object:
-            events.append("session-stop")
-            return super().request_physical_stop()
+        def abort_runtime(self, reason: RuntimeAbortReason) -> object:
+            events.append("session-abort")
+            return super().abort_runtime(reason)
 
     def session_factory(*, api_key, on_cue_audio, on_audio_preempt) -> FakeSession:
         del api_key, on_cue_audio
@@ -2779,8 +2984,10 @@ def test_monitor_closes_before_shutdown_requests_session_stop(tmp_path: Path) ->
 
     service.shutdown()
 
-    assert events == ["monitor-close", "session-stop"]
+    assert events == ["monitor-close", "session-abort"]
     assert sessions[0].stop_requests == 1
+    assert sessions[0].abort_requests == [RuntimeAbortReason.SERVICE_SHUTDOWN]
+    assert sessions[0].physical_stop_requests == 0
 
 
 def test_persistent_listener_accept_error_is_terminal(tmp_path: Path) -> None:
@@ -2870,8 +3077,8 @@ def test_provider_failure_before_activation_rebuilds_a_local_idle_lane(
             failure_reported.set()
             return SimpleNamespace(failure_kind="ProviderUnavailable", end_signal=None)
 
-        def request_physical_stop(self) -> object:
-            result = super().request_physical_stop()
+        def abort_runtime(self, reason: RuntimeAbortReason) -> object:
+            result = super().abort_runtime(reason)
             failed_session_stopped.set()
             return result
 
@@ -3339,6 +3546,8 @@ def test_button_quiesces_audio_before_blocking_realtime_pump_returns(
     assert speakers[0].preemptions >= 1
     assert speakers[0].closed
     assert sessions[0].stop_requests == 1
+    assert sessions[0].physical_stop_requests == 1
+    assert sessions[0].abort_requests == []
     assert service.current_mode is SessionMode.STOPPED
     service.shutdown()
 
@@ -3370,6 +3579,8 @@ def test_remote_stop_quiesces_audio_before_blocking_realtime_pump_returns(
     assert speaker.preemptions >= 1
     assert speaker.closed
     assert harness.sessions[0].stop_requests == 1
+    assert harness.sessions[0].abort_requests == [RuntimeAbortReason.REMOTE_STOP]
+    assert harness.sessions[0].physical_stop_requests == 0
     assert harness.service.current_mode is SessionMode.STOPPED
     harness.service.shutdown()
 
@@ -3408,4 +3619,6 @@ def test_shutdown_quiesces_audio_before_blocking_realtime_pump_returns(
     assert speaker.preemptions >= 1
     assert speaker.closed
     assert harness.sessions[0].stop_requests == 1
+    assert harness.sessions[0].abort_requests == [RuntimeAbortReason.SERVICE_SHUTDOWN]
+    assert harness.sessions[0].physical_stop_requests == 0
     assert harness.service.current_mode is SessionMode.STOPPED

@@ -35,6 +35,7 @@ from recoverybox.realtime import (
     BoundedOrderedTransport,
     RealtimeTransport,
     ReleasedCueAudio,
+    RuntimeAbortReason,
     SessionEndSignal,
     SessionEndSource,
     WebSocketJsonTransport,
@@ -122,6 +123,7 @@ class SquatDemoEndReason(StrEnum):
     PHYSICAL_STOP = "physical_stop"
     VALIDATED_TOOL_CALL = "validated_tool_call"
     MAX_FRAMES = "max_frames"
+    RUNTIME_ABORT = "runtime_abort"
 
 
 class SquatDemoCommandSource(Protocol):
@@ -752,14 +754,9 @@ class LaptopSquatDemo:
                     self.config.max_frames is not None
                     and frames_processed >= self.config.max_frames
                 ):
-                    signal = self._request_physical_stop()
+                    signal = self.session.abort_runtime(RuntimeAbortReason.MAX_FRAMES_REACHED)
                     winning_signal = self.session.end_controller.end_signal or signal
-                    end_reason = (
-                        SquatDemoEndReason.VALIDATED_TOOL_CALL
-                        if winning_signal is not None
-                        and winning_signal.source is SessionEndSource.VALIDATED_TOOL_CALL
-                        else SquatDemoEndReason.MAX_FRAMES
-                    )
+                    end_reason = _end_reason_from_signal(winning_signal)
                     break
 
             if end_reason is None:
@@ -863,13 +860,6 @@ class LaptopSquatDemo:
         if mode in {SessionMode.IDLE, SessionMode.CHECK_IN}:
             if self.session.activate_exercise(analysis):
                 self._write("[exercise] active")
-                if self.config.voice_enabled and self.realtime_failure_kind is not None:
-                    # A failed requested cloud edge is cautionary.  Tracking
-                    # continues, but coaching requires an explicit later run.
-                    try:
-                        self.session.coordinator.transition_to(SessionMode.PAUSED)
-                    except Exception:
-                        pass
             return
 
         if mode is not SessionMode.PAUSED or not self._resume_requested:
@@ -990,7 +980,7 @@ class LaptopSquatDemo:
         self._receiver_stop.set()
         if not self.session.ended:
             try:
-                self.session.request_physical_stop()
+                self.session.abort_runtime(RuntimeAbortReason.LAUNCHER_CLEANUP)
             except Exception:
                 pass
 
@@ -1017,6 +1007,10 @@ class LaptopSquatDemo:
 def _end_reason_from_signal(signal: SessionEndSignal | None) -> SquatDemoEndReason:
     if signal is not None and signal.source is SessionEndSource.VALIDATED_TOOL_CALL:
         return SquatDemoEndReason.VALIDATED_TOOL_CALL
+    if signal is not None and signal.source is SessionEndSource.RUNTIME_ABORT:
+        if signal.abort_reason is RuntimeAbortReason.MAX_FRAMES_REACHED:
+            return SquatDemoEndReason.MAX_FRAMES
+        return SquatDemoEndReason.RUNTIME_ABORT
     return SquatDemoEndReason.PHYSICAL_STOP
 
 

@@ -32,6 +32,7 @@ from recoverybox.laptop.squat_launcher import (
     run_squat_demo,
     validate_laptop_runtime_pins,
 )
+from recoverybox.realtime import RuntimeAbortReason, SessionEndSignal
 from recoverybox.remote_pose import RemotePoseRequest
 
 SERVICE_EPOCH = "a" * 64
@@ -583,6 +584,44 @@ def test_bounded_launcher_validates_model_before_camera_and_uses_one_connection(
     assert player.closed
     assert "push-to-talk" not in output.getvalue()
     assert "Enter toggles" not in output.getvalue()
+
+
+def test_physical_stop_winning_at_max_frame_is_not_misclassified(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "pose.task"
+    source = FakePoseSource([FakeSample(100, object())])
+    tracker = FakeTracker([analysis(100)])
+    app = build_squat_demo(
+        SquatDemoConfig(
+            model_asset_path=model_path,
+            preview=False,
+            voice_enabled=False,
+            microphone_enabled=False,
+            max_frames=1,
+        ),
+        environment={},
+        output=io.StringIO(),
+        dependencies=dependencies(
+            model_path=model_path,
+            source=source,
+            tracker=tracker,
+        ),
+    )
+    original_abort = app.session.abort_runtime
+
+    def physical_stop_wins(reason: RuntimeAbortReason) -> SessionEndSignal | None:
+        app.session.request_physical_stop()
+        return original_abort(reason)
+
+    monkeypatch.setattr(app.session, "abort_runtime", physical_stop_wins)
+
+    result = app.run()
+
+    assert result.end_reason is SquatDemoEndReason.PHYSICAL_STOP
+    assert app.session.end_controller.end_signal is not None
+    assert app.session.end_controller.end_signal.source.value == "physical_stop"
 
 
 def test_no_voice_camera_run_never_constructs_network_or_native_audio(tmp_path: Path) -> None:

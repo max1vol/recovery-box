@@ -1,5 +1,7 @@
 """Clean protocol, transport, validation, and safety boundaries for Realtime."""
 
+from recoverybox.session_end import RuntimeAbortReason
+
 from .client import RealtimeClientResult, RealtimeSession, RejectedToolCall
 from .cue_delivery import (
     DEFAULT_CUE_DELIVERY_CONFIG,
@@ -119,6 +121,7 @@ __all__ = [
     "RejectedToolCall",
     "ReleasedCueAudio",
     "ReleasedModelAudio",
+    "RuntimeAbortReason",
     "ServerEventKind",
     "SessionControlError",
     "SessionEndController",

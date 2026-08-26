@@ -20,16 +20,18 @@ from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from recoverybox.core import (
-    DEFAULT_CUE_CATALOG,
     ApprovedCueCatalog,
     CueId,
     CueKind,
+    Guardian,
     GuardianAction,
     GuardianDecision,
     GuardianReason,
+    GuardianRuntimeFault,
     SessionMode,
 )
 from recoverybox.core.cues import SQUAT_SCRIPTED_SESSION_CUE_IDS
+from recoverybox.session_end import SessionEndSignal
 
 
 class SessionCompositionError(RuntimeError):
@@ -104,6 +106,47 @@ class ApprovedCuePlaybackPort(Protocol):
         """Request the exact authorized phrase through the gated speech path."""
 
 
+@runtime_checkable
+class SessionEndAuthorityPort(Protocol):
+    """Verify termination signals from one exact session-end controller."""
+
+    def issued(self, signal: object) -> bool: ...
+
+
+@dataclass(frozen=True, slots=True)
+class GuardianEscalationRecord:
+    """Non-authoritative audit record of one applied Guardian escalation."""
+
+    guardian_rule_version: str
+    reason_codes: tuple[GuardianReason, ...]
+    guardian_sequence: int
+
+
+@runtime_checkable
+class EmergencyEscalationPort(Protocol):
+    """Local side effect accepting the sealed Guardian verdict itself."""
+
+    def request_emergency_escalation(
+        self,
+        decision: GuardianDecision,
+    ) -> None: ...
+
+
+class _BoundGuardianEscalationAudit:
+    """Default production sink retaining sealed escalation provenance."""
+
+    def __init__(self, guardian: Guardian) -> None:
+        self._guardian = guardian
+        self._decisions: list[GuardianDecision] = []
+        self._lock = threading.Lock()
+
+    def request_emergency_escalation(self, decision: GuardianDecision) -> None:
+        if not self._guardian.issued(decision) or decision.action is not GuardianAction.ESCALATE:
+            raise TypeError("escalation requires the bound Guardian's sealed verdict")
+        with self._lock:
+            self._decisions.append(decision)
+
+
 @dataclass(frozen=True, slots=True)
 class GuardianDecisionEffect:
     """Observable result of applying one Guardian decision at the edge."""
@@ -112,6 +155,7 @@ class GuardianDecisionEffect:
     current_mode: SessionMode
     action: GuardianAction
     cue_authorization: ApprovedCuePlaybackAuthorization | None = None
+    escalation_record: GuardianEscalationRecord | None = None
     model_audio_preempted: bool = False
 
 
@@ -129,20 +173,38 @@ class SessionCoordinator(SessionModeProvider):
     def __init__(
         self,
         *,
+        guardian: Guardian,
         cue_playback: ApprovedCuePlaybackPort,
-        cue_catalog: ApprovedCueCatalog = DEFAULT_CUE_CATALOG,
+        session_end_authority: SessionEndAuthorityPort,
+        escalation_port: EmergencyEscalationPort | None = None,
+        cue_catalog: ApprovedCueCatalog | None = None,
         catalog_version: str = DEFAULT_CATALOG_VERSION,
-        initial_mode: SessionMode = SessionMode.IDLE,
     ) -> None:
-        if not isinstance(initial_mode, SessionMode):
-            raise TypeError("initial_mode must be a SessionMode")
+        if not isinstance(guardian, Guardian):
+            raise TypeError("guardian must be a Guardian")
+        if not isinstance(session_end_authority, SessionEndAuthorityPort):
+            raise TypeError("session_end_authority must verify one end controller")
+        if escalation_port is not None and not isinstance(
+            escalation_port,
+            EmergencyEscalationPort,
+        ):
+            raise TypeError("escalation_port must implement EmergencyEscalationPort")
+        approved_catalog = guardian.cue_catalog if cue_catalog is None else cue_catalog
+        if approved_catalog is not guardian.cue_catalog:
+            raise ValueError("cue_catalog must be the bound Guardian's catalog")
         if not catalog_version.strip():
             raise ValueError("catalog_version must not be empty")
+        self._guardian = guardian
         self._cue_playback = cue_playback
-        self._cue_catalog = cue_catalog
+        self._session_end_authority = session_end_authority
+        self._escalation_port = escalation_port or _BoundGuardianEscalationAudit(guardian)
+        self._cue_catalog = approved_catalog
         self._catalog_version = catalog_version.strip()
-        self._mode = initial_mode
+        self._mode = SessionMode.IDLE
         self._model_audio_preemptors: list[ModelAudioPreemptionPort] = []
+        self._last_guardian_action: GuardianAction | None = None
+        self._last_escalation_record: GuardianEscalationRecord | None = None
+        self._termination_signal: SessionEndSignal | None = None
         # Coordinator operations must be linearly ordered without making mode
         # reads wait on output ports.  In particular, cue delivery holds its
         # own lock while it performs the final mode check and speaker handoff.
@@ -165,6 +227,27 @@ class SessionCoordinator(SessionModeProvider):
     def catalog_version(self) -> str:
         return self._catalog_version
 
+    @property
+    def last_guardian_action(self) -> GuardianAction | None:
+        """Last sealed Guardian action applied, including ESCALATE."""
+
+        with self._lock:
+            return self._last_guardian_action
+
+    @property
+    def termination_signal(self) -> SessionEndSignal | None:
+        """Typed lifecycle end, kept separate from Guardian STOP/ESCALATE."""
+
+        with self._lock:
+            return self._termination_signal
+
+    @property
+    def last_escalation_record(self) -> GuardianEscalationRecord | None:
+        """Last retained ESCALATE audit record, independent of STOPPED mode."""
+
+        with self._lock:
+            return self._last_escalation_record
+
     def register_model_audio_preemptor(
         self,
         preemptor: ModelAudioPreemptionPort,
@@ -181,7 +264,7 @@ class SessionCoordinator(SessionModeProvider):
             if all(existing is not preemptor for existing in self._model_audio_preemptors):
                 self._model_audio_preemptors.append(preemptor)
 
-    def transition_to(self, mode: SessionMode) -> SessionMode:
+    def _transition_to(self, mode: SessionMode) -> SessionMode:
         """Set product mode, preempting before publishing a restricted mode.
 
         The prompt-cue port's synchronous preemption is mutually exclusive
@@ -194,6 +277,10 @@ class SessionCoordinator(SessionModeProvider):
 
         if not isinstance(mode, SessionMode):
             raise TypeError("mode must be a SessionMode")
+        if mode is SessionMode.ACTIVE_EXERCISE:
+            raise SessionCompositionError(
+                "ACTIVE_EXERCISE requires a successful Guardian-authorized activation"
+            )
         with self._operation_lock:
             with self._lock:
                 previous = self._mode
@@ -212,7 +299,62 @@ class SessionCoordinator(SessionModeProvider):
                     self._mode = mode
             return previous
 
-    def begin_active_exercise_from_check_in(self) -> SessionMode:
+    def enter_check_in(self) -> SessionMode:
+        """Enter the conversational check-in phase from IDLE only."""
+
+        with self._operation_lock:
+            if self.current_mode is not SessionMode.IDLE:
+                raise SessionCompositionError("check-in requires IDLE mode")
+            return self._transition_to(SessionMode.CHECK_IN)
+
+    def activate_after_guardian_continue(
+        self,
+        decision: GuardianDecision,
+    ) -> SessionMode:
+        """Enter or resume ACTIVE only with this Guardian's CONTINUE verdict."""
+
+        self._require_guardian_decision(decision)
+        if decision.action is not GuardianAction.CONTINUE:
+            raise SessionCompositionError("exercise activation requires Guardian CONTINUE")
+        with self._operation_lock:
+            if not self._guardian.consume_activation(decision):
+                raise SessionCompositionError(
+                    "exercise activation requires the latest unused Guardian CONTINUE"
+                )
+            previous = self.current_mode
+            if previous not in {
+                SessionMode.IDLE,
+                SessionMode.CHECK_IN,
+                SessionMode.PAUSED,
+            }:
+                raise SessionCompositionError(
+                    "exercise activation requires IDLE, CHECK_IN, or PAUSED mode"
+                )
+            with self._lock:
+                self._last_guardian_action = decision.action
+            if previous is SessionMode.CHECK_IN:
+                return self._activate_from_check_in_locked()
+            return self._activate_from_idle_or_pause_locked()
+
+    def _activate_from_idle_or_pause_locked(self) -> SessionMode:
+        """Preempt first and publish ACTIVE only after every boundary succeeds."""
+
+        previous = self.current_mode
+        try:
+            self._preempt_model_audio()
+        except Exception as exc:
+            try:
+                self._apply_runtime_fault_locked(GuardianRuntimeFault.RUNTIME_BOUNDARY_FAILURE)
+            except Exception:
+                pass
+            raise SessionCompositionError(
+                "model audio preemption failed during exercise activation"
+            ) from exc
+        with self._lock:
+            self._mode = SessionMode.ACTIVE_EXERCISE
+        return previous
+
+    def _activate_from_check_in_locked(self) -> SessionMode:
         """Enter ACTIVE while preserving only the exact prompt-cue lane.
 
         A CHECK_IN welcome or detection cue may still be in the quarantined
@@ -232,7 +374,7 @@ class SessionCoordinator(SessionModeProvider):
                     preemptor.preempt_model_audio()
             except Exception as exc:
                 try:
-                    self.transition_to(SessionMode.PAUSED)
+                    self._apply_runtime_fault_locked(GuardianRuntimeFault.RUNTIME_BOUNDARY_FAILURE)
                 except Exception:
                     pass
                 raise SessionCompositionError(
@@ -254,26 +396,77 @@ class SessionCoordinator(SessionModeProvider):
         synchronously preempt both the speaker lane and registered model gates.
         """
 
-        if not isinstance(decision, GuardianDecision):
-            raise TypeError("decision must be a GuardianDecision")
+        self._require_guardian_decision(decision)
         with self._operation_lock:
             return self._apply_guardian_decision(decision)
+
+    def apply_runtime_fault(
+        self,
+        fault: GuardianRuntimeFault,
+    ) -> GuardianDecisionEffect:
+        """Ask the bound Guardian to arbitrate one typed runtime fault."""
+
+        if not isinstance(fault, GuardianRuntimeFault):
+            raise TypeError("fault must be a GuardianRuntimeFault")
+        with self._operation_lock:
+            return self._apply_runtime_fault_locked(fault)
+
+    def apply_session_end(self, signal: SessionEndSignal) -> SessionMode:
+        """Apply one sealed lifecycle termination without forging Guardian STOP."""
+
+        if not self._session_end_authority.issued(signal):
+            raise TypeError("signal must be issued by the bound SessionEndController")
+        with self._operation_lock:
+            with self._lock:
+                previous_signal = self._termination_signal
+            if previous_signal is not None:
+                if previous_signal is signal:
+                    return self.current_mode
+                raise SessionCompositionError("session already has a different termination")
+            try:
+                previous = self._transition_to(SessionMode.STOPPED)
+            finally:
+                # _transition_to publishes STOPPED in its own finally block.
+                # Commit the already-minted one-shot source even when output
+                # preemption reports a cleanup failure afterward.
+                with self._lock:
+                    self._termination_signal = signal
+            return previous
+
+    def _apply_runtime_fault_locked(
+        self,
+        fault: GuardianRuntimeFault,
+    ) -> GuardianDecisionEffect:
+        decision = self._guardian.decide_runtime_fault(fault)
+        return self._apply_guardian_decision(decision, allow_idle=True)
+
+    def _require_guardian_decision(self, decision: object) -> None:
+        if not isinstance(decision, GuardianDecision) or not self._guardian.issued(decision):
+            raise TypeError("decision must be issued by the bound Guardian")
 
     def _apply_guardian_decision(
         self,
         decision: GuardianDecision,
+        *,
+        allow_idle: bool = False,
     ) -> GuardianDecisionEffect:
         """Apply one already-validated decision under the operation lock."""
 
         previous = self.current_mode
-        if previous not in {
+        allowed_modes = {
             SessionMode.CHECK_IN,
             SessionMode.ACTIVE_EXERCISE,
             SessionMode.PAUSED,
-        }:
+        }
+        if allow_idle:
+            allowed_modes.add(SessionMode.IDLE)
+        if previous not in allowed_modes:
             raise SessionCompositionError(
                 "Guardian decisions require CHECK_IN, ACTIVE_EXERCISE, or PAUSED mode"
             )
+
+        with self._lock:
+            self._last_guardian_action = decision.action
 
         if decision.action is GuardianAction.CONTINUE:
             # A safe observation never silently resumes a prior pause.
@@ -286,7 +479,7 @@ class SessionCoordinator(SessionModeProvider):
         if decision.action is GuardianAction.CUE:
             if previous is SessionMode.CHECK_IN:
                 if decision.cue_id not in SQUAT_SCRIPTED_SESSION_CUE_IDS:
-                    self.transition_to(SessionMode.PAUSED)
+                    self._apply_runtime_fault_locked(GuardianRuntimeFault.RUNTIME_BOUNDARY_FAILURE)
                     raise CueAuthorizationError("only reviewed scripted cues can play in CHECK_IN")
             elif previous is not SessionMode.ACTIVE_EXERCISE:
                 raise CueAuthorizationError(
@@ -295,7 +488,7 @@ class SessionCoordinator(SessionModeProvider):
             try:
                 authorization = self._authorize_cue(decision)
             except (CueAuthorizationError, KeyError, TypeError, ValueError) as exc:
-                self.transition_to(SessionMode.PAUSED)
+                self._apply_runtime_fault_locked(GuardianRuntimeFault.RUNTIME_BOUNDARY_FAILURE)
                 raise CueAuthorizationError("Guardian cue is not in the approved catalog") from exc
 
             try:
@@ -303,7 +496,7 @@ class SessionCoordinator(SessionModeProvider):
             except Exception:
                 # Speaker/cue resolution failures make the movement
                 # non-coachable until the local runtime explicitly resumes.
-                self.transition_to(SessionMode.PAUSED)
+                self._apply_runtime_fault_locked(GuardianRuntimeFault.CUE_DELIVERY_UNAVAILABLE)
                 raise
             return GuardianDecisionEffect(
                 previous_mode=previous,
@@ -320,11 +513,36 @@ class SessionCoordinator(SessionModeProvider):
         else:  # Defensive if an invalid enum-like value crosses a Python boundary.
             raise SessionCompositionError("unsupported Guardian action")
 
-        self.transition_to(target)
+        escalation: GuardianEscalationRecord | None = None
+        transition_error: Exception | None = None
+        try:
+            self._transition_to(target)
+        except Exception as exc:
+            transition_error = exc
+        escalation_error: Exception | None = None
+        if decision.action is GuardianAction.ESCALATE:
+            escalation = GuardianEscalationRecord(
+                guardian_rule_version=decision.rule_version,
+                reason_codes=decision.reason_codes,
+                guardian_sequence=decision.sequence,
+            )
+            with self._lock:
+                self._last_escalation_record = escalation
+            try:
+                self._escalation_port.request_emergency_escalation(decision)
+            except Exception as exc:
+                escalation_error = exc
+        if escalation_error is not None:
+            raise SessionCompositionError(
+                "emergency escalation side effect failed after safe stop"
+            ) from escalation_error
+        if transition_error is not None:
+            raise transition_error
         return GuardianDecisionEffect(
             previous_mode=previous,
             current_mode=target,
             action=decision.action,
+            escalation_record=escalation,
             model_audio_preempted=True,
         )
 

@@ -59,14 +59,29 @@ def _observation(
     *,
     assessable: bool = False,
     rep_count: int = 0,
+    frame_received: bool = True,
+    detector_ms: float | None = 7.0,
+    pose_ms: float | None = 13.0,
+    inference_ms: float | None = 20.0,
+    evidence_age_ms: float | None = 30.0,
+    timed_out: bool | None = None,
+    capture_missed: bool = False,
+    worker_timed_out: bool = False,
+    parent_stale: bool = False,
 ) -> V4L2NcnnPoseObservation:
+    is_timed_out = not assessable if timed_out is None else timed_out
     return V4L2NcnnPoseObservation(
         analysis=_analysis(timestamp_ms, assessable=assessable, rep_count=rep_count),
-        frame_received=True,
-        inference_ms=20.0,
-        evidence_age_ms=30.0,
-        person_score=0.9 if assessable else None,
-        timed_out=not assessable,
+        frame_received=frame_received,
+        detector_ms=detector_ms,
+        pose_ms=pose_ms,
+        inference_ms=inference_ms,
+        evidence_age_ms=evidence_age_ms,
+        person_score=0.9 if assessable and not parent_stale else None,
+        timed_out=is_timed_out,
+        capture_missed=capture_missed,
+        worker_timed_out=worker_timed_out,
+        parent_stale=parent_stale,
     )
 
 
@@ -114,6 +129,98 @@ def test_yuyv_capture_requires_even_width_and_bounded_buffer_count() -> None:
         V4L2NcnnPoseConfig(width=321)
     with pytest.raises(PiPoseConfigurationError, match="between 2 and 8"):
         V4L2NcnnPoseConfig(buffer_count=9)
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["frame_received", "timed_out", "capture_missed", "worker_timed_out", "parent_stale"],
+)
+def test_observation_requires_explicit_boolean_diagnostic_flags(field_name: str) -> None:
+    values = {
+        "analysis": _analysis(1_000),
+        "frame_received": True,
+        "detector_ms": 7.0,
+        "pose_ms": None,
+        "inference_ms": 7.0,
+        "evidence_age_ms": 20.0,
+        "person_score": None,
+        "timed_out": False,
+        "capture_missed": False,
+        "worker_timed_out": False,
+        "parent_stale": False,
+    }
+    values[field_name] = 1
+
+    with pytest.raises(TypeError, match="flags must be booleans"):
+        V4L2NcnnPoseObservation(**values)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("field_name", ["detector_ms", "pose_ms", "inference_ms"])
+def test_observation_rejects_invalid_inference_diagnostics(field_name: str) -> None:
+    values = {
+        "analysis": _analysis(1_000),
+        "frame_received": True,
+        "detector_ms": 7.0,
+        "pose_ms": None,
+        "inference_ms": 7.0,
+        "evidence_age_ms": 20.0,
+        "person_score": None,
+        "timed_out": False,
+        "capture_missed": False,
+        "worker_timed_out": False,
+        "parent_stale": False,
+    }
+    values[field_name] = float("nan")
+
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        V4L2NcnnPoseObservation(**values)  # type: ignore[arg-type]
+
+
+def test_observation_rejects_contradictory_failure_diagnostics() -> None:
+    with pytest.raises(ValueError, match="missed capture"):
+        _observation(1_000, capture_missed=True)
+    with pytest.raises(ValueError, match="worker timeout"):
+        _observation(1_000, worker_timed_out=True)
+    with pytest.raises(ValueError, match="must be timed out"):
+        _observation(1_000, assessable=True, parent_stale=True)
+
+
+def test_observation_requires_complete_received_frame_timing() -> None:
+    with pytest.raises(ValueError, match="requires complete"):
+        _observation(1_000, detector_ms=None)
+    with pytest.raises(ValueError, match="may not expose"):
+        _observation(
+            1_000,
+            frame_received=False,
+            detector_ms=7.0,
+            pose_ms=None,
+            inference_ms=None,
+            evidence_age_ms=None,
+        )
+
+
+@pytest.mark.parametrize(
+    ("detector_ms", "pose_ms", "inference_ms", "evidence_age_ms"),
+    [
+        (21.0, None, 20.0, 30.0),
+        (7.0, 21.0, 20.0, 30.0),
+        (7.0, None, 31.0, 30.0),
+    ],
+)
+def test_observation_rejects_impossible_timing_order(
+    detector_ms: float,
+    pose_ms: float | None,
+    inference_ms: float,
+    evidence_age_ms: float,
+) -> None:
+    with pytest.raises(ValueError, match="timing order"):
+        _observation(
+            1_000,
+            detector_ms=detector_ms,
+            pose_ms=pose_ms,
+            inference_ms=inference_ms,
+            evidence_age_ms=evidence_age_ms,
+        )
 
 
 class _FakeMapping(bytearray):
@@ -473,10 +580,48 @@ def test_child_side_source_composes_ncnn_and_tracker_without_frame_output() -> N
 
     assert observations[-1].analysis.rep_count == 1
     assert all(observation.analysis.assessable for observation in observations)
+    assert all(observation.detector_ms == 5.0 for observation in observations)
+    assert all(observation.pose_ms == 5.0 for observation in observations)
+    assert all(observation.inference_ms == 10.0 for observation in observations)
+    assert all(observation.evidence_age_ms == 20.0 for observation in observations)
+    assert all(
+        not observation.capture_missed
+        and not observation.worker_timed_out
+        and not observation.parent_stale
+        for observation in observations
+    )
     assert all(not hasattr(observation, "frame") for observation in observations)
     assert marker not in repr(observations).encode()
     assert all(lease.released for lease in leases)
     assert camera.closed and estimator.closed
+
+
+def test_child_side_capture_miss_has_no_inference_timing() -> None:
+    camera = _FakeCamera([None])
+    estimator = _FakeEstimator([])
+    source = pose_module._InProcessV4L2NcnnPoseSource(
+        V4L2NcnnPoseConfig(width=320, height=240),
+        camera=camera,  # type: ignore[arg-type]
+        converter=_FakeConverter(b"unused"),
+        estimator=estimator,
+        clock=lambda: 1.0,
+    )
+    source.open()
+
+    observation = source.read()
+
+    assert not observation.analysis.assessable
+    assert observation.analysis.issues == (SquatAssessmentIssue.CAMERA_TIMEOUT,)
+    assert not observation.frame_received
+    assert observation.capture_missed
+    assert observation.timed_out
+    assert not observation.worker_timed_out
+    assert not observation.parent_stale
+    assert observation.detector_ms is None
+    assert observation.pose_ms is None
+    assert observation.inference_ms is None
+    assert observation.evidence_age_ms is None
+    source.close()
 
 
 class _FakeWorker:
@@ -500,6 +645,7 @@ class _FakeWorker:
 
 def test_public_source_enforces_bounded_worker_timeout_and_fails_closed() -> None:
     worker = _FakeWorker([None])
+    worker.failure_kind = "LocalPoseWorkerTimeout"
     source = V4L2NcnnPoseSource(
         V4L2NcnnPoseConfig(worker_timeout_seconds=0.25),
         worker=worker,
@@ -511,6 +657,14 @@ def test_public_source_enforces_bounded_worker_timeout_and_fails_closed() -> Non
 
     assert not observation.analysis.assessable
     assert observation.analysis.issues == (SquatAssessmentIssue.CAMERA_TIMEOUT,)
+    assert observation.worker_timed_out
+    assert not observation.capture_missed
+    assert not observation.parent_stale
+    assert not observation.frame_received
+    assert observation.detector_ms is None
+    assert observation.pose_ms is None
+    assert observation.inference_ms is None
+    assert observation.evidence_age_ms is None
     assert worker.read_timeouts == [0.25]
     with pytest.raises(PiPoseRuntimeError, match="unavailable"):
         source.read()
@@ -520,11 +674,10 @@ def test_public_source_enforces_bounded_worker_timeout_and_fails_closed() -> Non
 
 def test_public_source_rejects_stale_child_analysis_and_preserves_rep_count() -> None:
     worker = _FakeWorker([_observation(1_000, assessable=True, rep_count=2)])
-    ticks = iter((1.6, 1.6))
     source = V4L2NcnnPoseSource(
         V4L2NcnnPoseConfig(),
         worker=worker,
-        clock=lambda: next(ticks),
+        clock=lambda: 1.6,
     )
     source.open()
 
@@ -533,6 +686,99 @@ def test_public_source_rejects_stale_child_analysis_and_preserves_rep_count() ->
     assert not observation.analysis.assessable
     assert observation.analysis.rep_count == 0
     assert observation.analysis.issues == (SquatAssessmentIssue.CAMERA_TIMEOUT,)
+    assert observation.frame_received
+    assert observation.detector_ms == 7.0
+    assert observation.pose_ms == 13.0
+    assert observation.inference_ms == 20.0
+    assert observation.evidence_age_ms == 600.0
+    assert observation.person_score is None
+    assert observation.timed_out
+    assert not observation.capture_missed
+    assert not observation.worker_timed_out
+    assert observation.parent_stale
+    source.close()
+
+
+def test_parent_stale_uses_larger_child_age_and_preserves_future_age() -> None:
+    old = _observation(
+        1_000,
+        assessable=True,
+        evidence_age_ms=750.0,
+    )
+    future = _observation(
+        2_000,
+        assessable=True,
+        evidence_age_ms=40.0,
+    )
+    old_source = V4L2NcnnPoseSource(
+        V4L2NcnnPoseConfig(),
+        worker=_FakeWorker([old]),
+        clock=lambda: 1.6,
+    )
+    future_source = V4L2NcnnPoseSource(
+        V4L2NcnnPoseConfig(),
+        worker=_FakeWorker([future]),
+        clock=lambda: 1.6,
+    )
+    old_source.open()
+    future_source.open()
+
+    rejected_old = old_source.read()
+    rejected_future = future_source.read()
+
+    assert rejected_old.parent_stale
+    assert rejected_old.evidence_age_ms == 750.0
+    assert rejected_future.parent_stale
+    assert rejected_future.evidence_age_ms == 40.0
+    old_source.close()
+    future_source.close()
+
+
+def test_parent_stale_capture_miss_preserves_capture_truth_and_parent_age() -> None:
+    missed = _observation(
+        1_000,
+        frame_received=False,
+        detector_ms=None,
+        pose_ms=None,
+        inference_ms=None,
+        evidence_age_ms=None,
+        capture_missed=True,
+    )
+    source = V4L2NcnnPoseSource(
+        V4L2NcnnPoseConfig(),
+        worker=_FakeWorker([missed]),
+        clock=lambda: 1.6,
+    )
+    source.open()
+
+    rejected = source.read()
+
+    assert rejected.parent_stale
+    assert rejected.capture_missed
+    assert not rejected.frame_received
+    assert rejected.evidence_age_ms == 600.0
+    assert rejected.detector_ms is None
+    assert rejected.pose_ms is None
+    assert rejected.inference_ms is None
+    source.close()
+
+
+def test_non_timeout_worker_failure_is_not_reported_as_worker_timeout() -> None:
+    worker = _FakeWorker([None])
+    worker.failure_kind = "LocalPoseWorkerProtocolError"
+    source = V4L2NcnnPoseSource(
+        V4L2NcnnPoseConfig(),
+        worker=worker,
+        clock=lambda: 2.0,
+    )
+    source.open()
+
+    observation = source.read()
+
+    assert observation.timed_out
+    assert not observation.worker_timed_out
+    assert not observation.capture_missed
+    assert not observation.parent_stale
     source.close()
 
 
@@ -706,8 +952,85 @@ class _FakeCheckSource:
         self.closed = True
 
 
-def test_bounded_check_status_is_numeric_and_contains_no_frame() -> None:
-    source = _FakeCheckSource([_observation(1_000, assessable=True)])
+def test_bounded_check_v2_status_has_separate_failure_counts_and_timing_maxima() -> None:
+    source = _FakeCheckSource(
+        [
+            _observation(1_000, assessable=True),
+            _observation(
+                1_100,
+                detector_ms=8.0,
+                pose_ms=None,
+                inference_ms=8.0,
+                evidence_age_ms=40.0,
+                timed_out=False,
+            ),
+            _observation(
+                1_200,
+                frame_received=False,
+                detector_ms=None,
+                pose_ms=None,
+                inference_ms=None,
+                evidence_age_ms=None,
+                capture_missed=True,
+            ),
+            _observation(
+                1_300,
+                frame_received=False,
+                detector_ms=None,
+                pose_ms=None,
+                inference_ms=None,
+                evidence_age_ms=None,
+                worker_timed_out=True,
+            ),
+            _observation(
+                1_400,
+                detector_ms=9.0,
+                pose_ms=11.0,
+                inference_ms=21.0,
+                evidence_age_ms=600.0,
+                parent_stale=True,
+            ),
+        ]
+    )
+
+    report = run_v4l2_ncnn_pose_check(
+        V4L2NcnnPoseConfig(),
+        max_frames=5,
+        source_factory=lambda config: source,  # type: ignore[arg-type]
+    )
+
+    assert report["service"] == "recoverybox-pi-v4l2-ncnn-check/v2"
+    assert report["frames"] == 5
+    assert report["frames_received"] == 3
+    assert report["fresh_frames"] == 2
+    assert report["assessable"] == 1
+    assert report["timeouts"] == 3
+    assert report["capture_misses"] == 1
+    assert report["worker_timeouts"] == 1
+    assert report["parent_stale_count"] == 1
+    assert report["detector_ms_max"] == 9.0
+    assert report["pose_ms_max"] == 13.0
+    assert report["inference_ms_max"] == 21.0
+    assert report["evidence_age_ms_max"] == 600.0
+    assert report["raw_frames_persisted"] == 0
+    assert report["audio"] == "disabled"
+    assert "frame" not in json.dumps(report).lower().replace("frames", "")
+    assert source.closed
+
+
+def test_bounded_check_keeps_pose_timing_nullable_when_no_person_is_detected() -> None:
+    source = _FakeCheckSource(
+        [
+            _observation(
+                1_000,
+                detector_ms=8.1254,
+                pose_ms=None,
+                inference_ms=8.1254,
+                evidence_age_ms=12.9999,
+                timed_out=False,
+            )
+        ]
+    )
 
     report = run_v4l2_ncnn_pose_check(
         V4L2NcnnPoseConfig(),
@@ -715,15 +1038,10 @@ def test_bounded_check_status_is_numeric_and_contains_no_frame() -> None:
         source_factory=lambda config: source,  # type: ignore[arg-type]
     )
 
-    assert report["frames"] == 1
-    assert report["frames_received"] == 1
-    assert report["fresh_frames"] == 1
-    assert report["assessable"] == 1
-    assert report["inference_ms_max"] == 20.0
-    assert report["raw_frames_persisted"] == 0
-    assert report["audio"] == "disabled"
-    assert "frame" not in json.dumps(report).lower().replace("frames", "")
-    assert source.closed
+    assert report["detector_ms_max"] == 8.125
+    assert report["pose_ms_max"] is None
+    assert report["inference_ms_max"] == 8.125
+    assert report["evidence_age_ms_max"] == 13.0
 
 
 def test_check_main_scrubs_runtime_details(monkeypatch, capsys) -> None:
@@ -741,7 +1059,7 @@ def test_check_main_scrubs_runtime_details(monkeypatch, capsys) -> None:
         "audio": "disabled",
         "failure": "PiPoseRuntimeError",
         "raw_frames_persisted": 0,
-        "service": "recoverybox-pi-v4l2-ncnn-check/v1",
+        "service": "recoverybox-pi-v4l2-ncnn-check/v2",
     }
     assert "PRIVATE" not in json.dumps(report)
 
@@ -751,7 +1069,7 @@ def test_check_main_fails_when_no_camera_frame_reaches_ncnn(monkeypatch, capsys)
         pose_module,
         "run_v4l2_ncnn_pose_check",
         lambda config, max_frames: {
-            "service": "recoverybox-pi-v4l2-ncnn-check/v1",
+            "service": "recoverybox-pi-v4l2-ncnn-check/v2",
             "frames": 3,
             "frames_received": 0,
             "fresh_frames": 0,
@@ -770,7 +1088,7 @@ def test_check_main_fails_when_received_frames_are_all_stale(monkeypatch, capsys
         pose_module,
         "run_v4l2_ncnn_pose_check",
         lambda config, max_frames: {
-            "service": "recoverybox-pi-v4l2-ncnn-check/v1",
+            "service": "recoverybox-pi-v4l2-ncnn-check/v2",
             "frames": 3,
             "frames_received": 3,
             "fresh_frames": 0,
@@ -783,3 +1101,66 @@ def test_check_main_fails_when_received_frames_are_all_stale(monkeypatch, capsys
     assert pose_module.main(["--max-frames", "3"]) == 1
     report = json.loads(capsys.readouterr().out)
     assert report["failure"] == "FreshPoseEvidenceUnavailable"
+
+
+def test_check_main_fails_partial_fresh_run_with_numeric_diagnostics(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        pose_module,
+        "run_v4l2_ncnn_pose_check",
+        lambda config, max_frames: {
+            "service": "recoverybox-pi-v4l2-ncnn-check/v2",
+            "capture": "v4l2-mmap-yuyv",
+            "conversion": "libyuv-yuy2-to-bgra",
+            "estimator": "ncnn-nanodet-rtmpose",
+            "frames": 3,
+            "frames_received": 1,
+            "fresh_frames": 1,
+            "assessable": 0,
+            "timeouts": 2,
+            "capture_misses": 2,
+            "worker_timeouts": 0,
+            "parent_stale_count": 0,
+            "detector_ms_max": 8.0,
+            "pose_ms_max": None,
+            "inference_ms_max": 8.0,
+            "evidence_age_ms_max": 20.0,
+            "raw_frames_persisted": 0,
+            "audio": "disabled",
+        },
+    )
+
+    assert pose_module.main(["--max-frames", "3"]) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["failure"] == "FreshPoseEvidenceUnavailable"
+    assert report["capture_misses"] == 2
+
+
+def test_check_main_accepts_complete_empty_room_detector_run(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        pose_module,
+        "run_v4l2_ncnn_pose_check",
+        lambda config, max_frames: {
+            "service": "recoverybox-pi-v4l2-ncnn-check/v2",
+            "capture": "v4l2-mmap-yuyv",
+            "conversion": "libyuv-yuy2-to-bgra",
+            "estimator": "ncnn-nanodet-rtmpose",
+            "frames": 3,
+            "frames_received": 3,
+            "fresh_frames": 3,
+            "assessable": 0,
+            "timeouts": 0,
+            "capture_misses": 0,
+            "worker_timeouts": 0,
+            "parent_stale_count": 0,
+            "detector_ms_max": 8.0,
+            "pose_ms_max": None,
+            "inference_ms_max": 8.0,
+            "evidence_age_ms_max": 20.0,
+            "raw_frames_persisted": 0,
+            "audio": "disabled",
+        },
+    )
+
+    assert pose_module.main(["--max-frames", "3"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert "failure" not in report

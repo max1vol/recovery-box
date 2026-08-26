@@ -24,6 +24,7 @@ _SOURCE_DIRECTORY: Final = "src"
 _DEPLOY_DIRECTORY: Final = "deploy"
 _DEPLOY_FILES: Final = frozenset(
     {
+        "recoverybox_pi_power_gate.py",
         "recoverybox_status.py",
         "recoverybox_tree_digest.py",
     }

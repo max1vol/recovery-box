@@ -44,9 +44,8 @@ Options:
   --admin-user USER   SSH account whose uid is 0 (default: root)
   -h, --help          Show this help
 
-If direct root SSH is disabled, run deploy/remove-legacy-voice-ai-bot.sh with
-sudo on the Pi and arrange equivalent root installation of the two unit files.
-The automated --apply path intentionally refuses to accept or pipe a password.
+The automated --apply path requires direct root SSH and intentionally refuses
+to accept or pipe a password.
 EOF
 }
 
@@ -104,6 +103,7 @@ cd "$repo_root"
 
 required_files=(
     pyproject.toml
+    deploy/recoverybox_pi_power_gate.py
     deploy/recoverybox_status.py
     deploy/recoverybox_tree_digest.py
     deploy/remove-legacy-voice-ai-bot.sh
@@ -125,9 +125,17 @@ for helper in scripts/fetch-pi-pose-ncnn-models.sh \
     [[ -x $helper ]] || fail "required NCNN helper is not executable: $helper"
 done
 
-for command in ssh python3 tailscale; do
+for command in ssh python3; do
     command -v "$command" >/dev/null || fail "$command is required"
 done
+if command -v tailscale >/dev/null 2>&1; then
+    tailscale_cli=$(command -v tailscale)
+elif [[ -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ]]; then
+    tailscale_cli=/Applications/Tailscale.app/Contents/MacOS/Tailscale
+else
+    fail "Tailscale CLI is required (install the macOS app or put tailscale on PATH)"
+fi
+readonly tailscale_cli
 if ((apply)); then
     command -v rsync >/dev/null || fail "rsync is required for --apply"
     command -v scp >/dev/null || fail "scp is required for --apply"
@@ -161,6 +169,10 @@ tree_helper_digest=$(local_file_digest deploy/recoverybox_tree_digest.py) ||
     fail "could not hash the trusted local tree-digest helper"
 [[ $tree_helper_digest =~ ^[0-9a-f]{64}$ ]] || fail "tree-digest helper hash is invalid"
 readonly tree_helper_digest
+power_gate_digest=$(local_file_digest deploy/recoverybox_pi_power_gate.py) ||
+    fail "could not hash the trusted Pi power-gate helper"
+[[ $power_gate_digest =~ ^[0-9a-f]{64}$ ]] || fail "Pi power-gate helper hash is invalid"
+readonly power_gate_digest
 verify_local_tree_helper() {
     local actual
     actual=$(local_file_digest deploy/recoverybox_tree_digest.py) ||
@@ -180,7 +192,7 @@ if pi_address not in tailnet or mac_address not in tailnet or pi_address == mac_
     raise SystemExit("Pi and Mac must have distinct Tailscale IPv4 addresses")
 PY
 
-tailscale ip -4 | grep -Fqx "$mac_ip" ||
+"$tailscale_cli" ip -4 | grep -Fqx "$mac_ip" ||
     fail "this Mac does not own the pinned Tailscale IPv4 address $mac_ip"
 
 # Both privilege levels connect to the verified literal Tailnet endpoint. A
@@ -467,6 +479,11 @@ do
 done
 REMOTE_ROOT_PREFLIGHT
 
+# Run the reviewed helper directly from stdin so dry-run preflight can reject
+# active undervoltage/throttling before any deployment stage exists.
+ssh "${ssh_options[@]}" "$admin_target" /usr/bin/python3 - \
+    <deploy/recoverybox_pi_power_gate.py
+
 printf 'Preflight passed: Pi 3 ABI, camera, GPIO, fresh paths, root authority, and Tailnet identity.\n'
 if ((!apply)); then
     cat <<EOF
@@ -609,7 +626,8 @@ rsync_options=(-rpt --delete --exclude=__pycache__/ --exclude='*.pyc')
 rsync_ssh='ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=10 -o ProxyCommand=none -o ProxyJump=none'
 rsync "${rsync_options[@]}" -e "$rsync_ssh" src/ "$admin_target:$remote_app_stage/src/"
 rsync -pt -e "$rsync_ssh" \
-    deploy/recoverybox_status.py deploy/recoverybox_tree_digest.py \
+    deploy/recoverybox_pi_power_gate.py deploy/recoverybox_status.py \
+    deploy/recoverybox_tree_digest.py \
     "$admin_target:$remote_app_stage/deploy/"
 rsync "${rsync_options[@]}" -e "$rsync_ssh" \
     "$local_asset_stage/runtime/" "$admin_target:$remote_asset_stage/runtime/"
@@ -657,14 +675,22 @@ for module, root in (
     if os.path.commonpath((Path(module.__file__).resolve(), root)) != str(root):
         raise SystemExit(1)
 
-path = stage / "deploy/recoverybox_status.py"
-spec = importlib.util.spec_from_file_location("_recoverybox_staged_status", path)
-if spec is None or spec.loader is None:
-    raise SystemExit(1)
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-if not callable(module.main):
-    raise SystemExit(1)
+for filename, module_name in (
+    ("recoverybox_pi_power_gate.py", "_recoverybox_staged_power_gate"),
+    ("recoverybox_status.py", "_recoverybox_staged_status"),
+):
+    path = stage / "deploy" / filename
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise SystemExit(1)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(module_name, None)
+    if not callable(module.main):
+        raise SystemExit(1)
 PY
 REMOTE_VERIFY_STAGE
 
@@ -895,15 +921,24 @@ current_app_digest=$(
 printf 'Stopping any prior RecoveryBox instance before direct replacement.\n'
 ssh "${ssh_options[@]}" "$admin_target" bash -s -- \
     "$pi_ip" "$pi_machine_id" "$MAIN_UNIT_PATH" "$STATUS_UNIT_PATH" \
+    "$remote_app_stage/deploy/recoverybox_pi_power_gate.py" "$power_gate_digest" \
     <<'REMOTE_STOP_RECOVERYBOX'
 set -eu
 expected_ip=$1
 expected_machine_id=$2
 main_fragment=$3
 status_fragment=$4
+power_gate=$5
+power_gate_digest=$6
 [ "$(id -u)" -eq 0 ] || exit 1
 [ "$(tr -d '\n' </etc/machine-id)" = "$expected_machine_id" ] || exit 1
 tailscale ip -4 | grep -Fqx "$expected_ip" || exit 1
+[ -f "$power_gate" ] && [ ! -L "$power_gate" ] || exit 1
+[ "$(stat -c %U:%G "$power_gate")" = root:root ] || exit 1
+[ "$(stat -c %a "$power_gate")" = 644 ] || exit 1
+[ "$(stat -c %h "$power_gate")" = 1 ] || exit 1
+[ "$(sha256sum "$power_gate" | awk '{print $1}')" = "$power_gate_digest" ] || exit 1
+/usr/bin/python3 "$power_gate"
 for spec in \
     "recoverybox-status.service:$status_fragment" \
     "recoverybox.service:$main_fragment"
@@ -924,7 +959,9 @@ REMOTE_STOP_RECOVERYBOX
 
 printf 'Permanently deleting the exact legacy assistant targets.\n'
 ssh "${ssh_options[@]}" "$admin_target" bash -s -- \
-    "$remote_user" "$pi_ip" "$pi_machine_id" <deploy/remove-legacy-voice-ai-bot.sh
+    "$remote_user" "$pi_ip" "$pi_machine_id" \
+    "$remote_app_stage/deploy/recoverybox_pi_power_gate.py" "$power_gate_digest" \
+    <deploy/remove-legacy-voice-ai-bot.sh
 
 printf 'Activating the fresh app without retaining a prior copy.\n'
 activated_app_pending=1
@@ -1102,7 +1139,7 @@ activation_result=$(ssh "${ssh_options[@]}" "$admin_target" bash -s -- \
     "$REMOTE_CREDENTIAL_DIR" "$REMOTE_OPENAI_CREDENTIAL" "$expected_app_digest" \
     "$tree_helper_digest" "$asset_verify_digest" "$deployment_marker" \
     "$REMOTE_LEGACY_ROOT" "$REMOTE_NCNN_RUNTIME" "$REMOTE_NCNN_MODELS" \
-    "$REMOTE_LIBYUV" <<'REMOTE_INSTALL_UNITS'
+    "$REMOTE_LIBYUV" "$power_gate_digest" <<'REMOTE_INSTALL_UNITS'
 set -eu
 expected_ip=$1
 expected_machine_id=$2
@@ -1131,6 +1168,8 @@ legacy_root=${23}
 runtime=${24}
 models=${25}
 libyuv=${26}
+power_gate_digest=${27}
+power_gate="$app/deploy/recoverybox_pi_power_gate.py"
 activation_started=0
 runtime_proven=0
 config_tree_created=0
@@ -1210,6 +1249,11 @@ stage_suffix=${stage#"$stage_prefix"}
 [ "$runtime" = "$app_root/runtime/ncnn" ] || exit 1
 [ "$models" = "$app_root/models/ncnn" ] || exit 1
 [ "$libyuv" = /usr/lib/arm-linux-gnueabihf/libyuv.so.0 ] || exit 1
+[ -f "$power_gate" ] && [ ! -L "$power_gate" ] || exit 1
+[ "$(stat -c %U:%G "$power_gate")" = root:root ] || exit 1
+[ "$(stat -c %a "$power_gate")" = 644 ] || exit 1
+[ "$(stat -c %h "$power_gate")" = 1 ] || exit 1
+[ "$(sha256sum "$power_gate" | awk '{print $1}')" = "$power_gate_digest" ] || exit 1
 [ "$(stat -c %U:%G "$stage")" = root:root ] || exit 1
 [ "$(stat -c %a "$stage")" = 700 ] || exit 1
 [ "$(stat -c %U:%G "$app_root")" = root:root ] || exit 1
@@ -1426,6 +1470,7 @@ PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 "$tree_helper_source" \
 
 # Exercise the exact activated camera/libyuv/NCNN path once, bounded and silent,
 # before handing long-lived ownership of /dev/video0 to the service.
+/usr/bin/python3 "$power_gate"
 set -a
 . "$config"
 set +a
@@ -1451,14 +1496,27 @@ except (IndexError, ValueError, json.JSONDecodeError):
 if pose_check_status != 0:
     failure = report.get("failure")
     if (
-        report.get("service") != "recoverybox-pi-v4l2-ncnn-check/v1"
+        report.get("service") != "recoverybox-pi-v4l2-ncnn-check/v2"
         or report.get("raw_frames_persisted") != 0
         or report.get("audio") != "disabled"
         or not isinstance(failure, str)
         or re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,63}", failure) is None
     ):
         raise SystemExit(1)
-    numeric_fields = ("frames_received", "fresh_frames", "timeouts", "inference_ms_max")
+    numeric_fields = (
+        "frames",
+        "frames_received",
+        "fresh_frames",
+        "assessable",
+        "timeouts",
+        "capture_misses",
+        "worker_timeouts",
+        "parent_stale_count",
+        "detector_ms_max",
+        "pose_ms_max",
+        "inference_ms_max",
+        "evidence_age_ms_max",
+    )
     numeric_summary = []
     for name in numeric_fields:
         value = report.get(name)
@@ -1476,13 +1534,17 @@ if pose_check_status != 0:
     )
     raise SystemExit(1)
 expected = {
-    "service": "recoverybox-pi-v4l2-ncnn-check/v1",
+    "service": "recoverybox-pi-v4l2-ncnn-check/v2",
     "capture": "v4l2-mmap-yuyv",
     "conversion": "libyuv-yuy2-to-bgra",
     "estimator": "ncnn-nanodet-rtmpose",
     "frames": 3,
     "frames_received": 3,
+    "fresh_frames": 3,
     "timeouts": 0,
+    "capture_misses": 0,
+    "worker_timeouts": 0,
+    "parent_stale_count": 0,
     "raw_frames_persisted": 0,
     "audio": "disabled",
 }
@@ -1490,31 +1552,45 @@ if any(report.get(key) != value for key, value in expected.items()):
     raise SystemExit(1)
 if frozenset(report) != {
     *expected,
-    "fresh_frames",
     "assessable",
+    "detector_ms_max",
+    "pose_ms_max",
     "inference_ms_max",
+    "evidence_age_ms_max",
 }:
-    raise SystemExit(1)
-fresh_frames = report.get("fresh_frames")
-if (
-    isinstance(fresh_frames, bool)
-    or not isinstance(fresh_frames, int)
-    or not 1 <= fresh_frames <= report["frames_received"]
-):
     raise SystemExit(1)
 if isinstance(report.get("assessable"), bool) or not isinstance(report.get("assessable"), int):
     raise SystemExit(1)
 if not 0 <= report["assessable"] <= 3:
     raise SystemExit(1)
-inference_ms = report.get("inference_ms_max")
+
+def bounded_duration(name, *, nullable=False):
+    value = report.get(name)
+    if value is None and nullable:
+        return None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or not 0 <= value < 500
+    ):
+        raise SystemExit(1)
+    return float(value)
+
+detector_ms = bounded_duration("detector_ms_max")
+pose_ms = bounded_duration("pose_ms_max", nullable=True)
+inference_ms = bounded_duration("inference_ms_max")
+evidence_age_ms = bounded_duration("evidence_age_ms_max")
+if report["assessable"] > 0 and pose_ms is None:
+    raise SystemExit(1)
 if (
-    isinstance(inference_ms, bool)
-    or not isinstance(inference_ms, (int, float))
-    or not math.isfinite(inference_ms)
-    or not 0 <= inference_ms < 500
+    detector_ms > inference_ms
+    or (pose_ms is not None and pose_ms > inference_ms)
+    or inference_ms > evidence_age_ms
 ):
     raise SystemExit(1)
 PY
+/usr/bin/python3 "$power_gate"
 systemctl enable recoverybox.service recoverybox-status.service >/dev/null
 systemctl restart recoverybox.service recoverybox-status.service
 

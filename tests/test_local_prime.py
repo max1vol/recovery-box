@@ -45,6 +45,7 @@ def test_dotenv_key_overrides_inherited_environment_without_exposing_value(
 ) -> None:
     env_file = tmp_path / ".env"
     env_file.write_text("OPENAI_API_KEY='new-local-key'\n", encoding="utf-8")
+    env_file.chmod(0o600)
 
     assert (
         load_local_openai_api_key(
@@ -58,6 +59,7 @@ def test_dotenv_key_overrides_inherited_environment_without_exposing_value(
 def test_key_loader_falls_back_to_environment_when_dotenv_has_no_key(tmp_path: Path) -> None:
     env_file = tmp_path / ".env"
     env_file.write_text("RECOVERYBOX_REALTIME_VOICE=marin\n", encoding="utf-8")
+    env_file.chmod(0o600)
 
     assert (
         load_local_openai_api_key(
@@ -75,11 +77,54 @@ def test_key_loader_rejects_missing_key_without_echoing_secret(tmp_path: Path) -
     assert "OPENAI_API_KEY=" not in str(raised.value)
 
 
+@pytest.mark.parametrize("mode", [0o640, 0o620, 0o604, 0o602])
+def test_key_loader_rejects_group_or_world_access_without_echoing_secret(
+    tmp_path: Path,
+    mode: int,
+) -> None:
+    env_file = tmp_path / ".env"
+    secret = "secret-must-not-be-reported"
+    env_file.write_text(f"OPENAI_API_KEY={secret}\n", encoding="utf-8")
+    env_file.chmod(mode)
+
+    with pytest.raises(LocalPrimeConfigurationError, match="group or others") as raised:
+        load_local_openai_api_key(env_file, {})
+
+    assert secret not in str(raised.value)
+
+
+def test_key_loader_rejects_symlink_including_through_local_config(tmp_path: Path) -> None:
+    credential = tmp_path / "credential.env"
+    credential.write_text("OPENAI_API_KEY=secret-must-not-be-reported\n", encoding="utf-8")
+    credential.chmod(0o600)
+    env_file = tmp_path / ".env"
+    env_file.symlink_to(credential)
+    config = LocalPrimeConfig(
+        tailscale_ip="100.70.100.93",
+        token_file=tmp_path / "pose-token.hex",
+        env_file=env_file,
+    )
+
+    with pytest.raises(LocalPrimeConfigurationError, match="private regular file") as raised:
+        load_local_openai_api_key(config.env_file, {})
+
+    assert "secret-must-not-be-reported" not in str(raised.value)
+
+
+def test_key_loader_rejects_non_regular_file(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.mkdir()
+
+    with pytest.raises(LocalPrimeConfigurationError, match="private regular file"):
+        load_local_openai_api_key(env_file, {"OPENAI_API_KEY": "environment-key"})
+
+
 def test_local_prime_uses_same_tailscale_ip_and_keeps_key_out_of_service_env(
     tmp_path: Path,
 ) -> None:
     env_file = tmp_path / ".env"
     env_file.write_text("OPENAI_API_KEY=file-key\n", encoding="utf-8")
+    env_file.chmod(0o600)
     captured: dict[str, object] = {}
     expected_dependencies = RemotePoseServiceDependencies()
 

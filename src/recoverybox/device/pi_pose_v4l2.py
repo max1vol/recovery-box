@@ -1,10 +1,10 @@
-"""Same-process V4L2, libyuv, and NCNN pose source for Raspberry Pi 3.
+"""Single-worker V4L2, libyuv, and NCNN pose source for Raspberry Pi 3.
 
 The camera is opened directly and streamed with V4L2 ``mmap`` buffers.  A
 dequeued YUYV buffer is converted to a private BGRA copy by libyuv, immediately
-requeued, and then consumed by NCNN.  No camera subprocess exists, and no raw
-frame is returned by the public source, written to disk, logged, or placed in
-status.
+requeued, and then consumed by NCNN in the same child worker.  There is no
+separate camera-only process or raw-frame transport, and no raw frame is
+returned by the public source, written to disk, logged, or placed in status.
 
 Only :class:`V4L2NcnnPoseObservation`, whose public payload is numeric, crosses
 the capture/inference boundary.  Hardware and C-library operations are
@@ -887,17 +887,35 @@ class V4L2NcnnPoseObservation:
 
     analysis: SquatAnalysis
     frame_received: bool
+    detector_ms: float | None
+    pose_ms: float | None
     inference_ms: float | None
     evidence_age_ms: float | None
     person_score: float | None
     timed_out: bool
+    capture_missed: bool
+    worker_timed_out: bool
+    parent_stale: bool
 
     def __post_init__(self) -> None:
         if not isinstance(self.analysis, SquatAnalysis):
             raise TypeError("analysis must be a SquatAnalysis")
-        if not isinstance(self.frame_received, bool) or not isinstance(self.timed_out, bool):
-            raise TypeError("frame flags must be booleans")
-        for field_name in ("inference_ms", "evidence_age_ms", "person_score"):
+        for field_name in (
+            "frame_received",
+            "timed_out",
+            "capture_missed",
+            "worker_timed_out",
+            "parent_stale",
+        ):
+            if not isinstance(getattr(self, field_name), bool):
+                raise TypeError("observation flags must be booleans")
+        for field_name in (
+            "detector_ms",
+            "pose_ms",
+            "inference_ms",
+            "evidence_age_ms",
+            "person_score",
+        ):
             value = getattr(self, field_name)
             if value is None:
                 continue
@@ -909,6 +927,32 @@ class V4L2NcnnPoseObservation:
             if field_name == "person_score" and converted > 1:
                 raise ValueError("person_score must not exceed one")
             object.__setattr__(self, field_name, converted)
+        if self.capture_missed and self.frame_received:
+            raise ValueError("a missed capture may not claim a received frame")
+        if self.worker_timed_out and self.frame_received:
+            raise ValueError("a worker timeout may not claim a received frame")
+        failure_flagged = self.capture_missed or self.worker_timed_out or self.parent_stale
+        if failure_flagged and not self.timed_out:
+            raise ValueError("failed or stale observations must be timed out")
+        if self.parent_stale and self.person_score is not None:
+            raise ValueError("stale observations may not expose a person score")
+        if self.frame_received:
+            if (
+                self.detector_ms is None
+                or self.inference_ms is None
+                or self.evidence_age_ms is None
+            ):
+                raise ValueError("a received frame requires complete detector and age timing")
+            if (
+                self.detector_ms > self.inference_ms
+                or (self.pose_ms is not None and self.pose_ms > self.inference_ms)
+                or self.inference_ms > self.evidence_age_ms
+            ):
+                raise ValueError("observation timing order is invalid")
+        elif any(
+            value is not None for value in (self.detector_ms, self.pose_ms, self.inference_ms)
+        ) or (self.evidence_age_ms is not None and not self.parent_stale):
+            raise ValueError("an unreceived frame may not expose inference timing")
 
 
 class _InProcessV4L2NcnnPoseSource:
@@ -988,10 +1032,15 @@ class _InProcessV4L2NcnnPoseSource:
                     issue=SquatAssessmentIssue.CAMERA_TIMEOUT,
                 ),
                 frame_received=False,
+                detector_ms=None,
+                pose_ms=None,
                 inference_ms=None,
                 evidence_age_ms=None,
                 person_score=None,
                 timed_out=True,
+                capture_missed=True,
+                worker_timed_out=False,
+                parent_stale=False,
             )
         with lease:
             bgra = self._converter.convert(
@@ -1030,10 +1079,15 @@ class _InProcessV4L2NcnnPoseSource:
         return V4L2NcnnPoseObservation(
             analysis=analysis,
             frame_received=True,
+            detector_ms=result.detector_ms,
+            pose_ms=result.pose_ms,
             inference_ms=result.total_ms,
             evidence_age_ms=result.evidence_age_ms,
             person_score=result.person_score,
             timed_out=result.timed_out,
+            capture_missed=False,
+            worker_timed_out=False,
+            parent_stale=False,
         )
 
     def close(self) -> None:
@@ -1337,8 +1391,7 @@ class V4L2NcnnPoseSource:
             timestamp = max(timestamp, self._last_timestamp_ms + 1)
         return timestamp
 
-    def _missing(self) -> V4L2NcnnPoseObservation:
-        timestamp_ms = self._now_ms()
+    def _missing_analysis(self, timestamp_ms: int) -> SquatAnalysis:
         analysis = SquatAnalysis(
             timestamp_ms=timestamp_ms,
             assessable=False,
@@ -1352,13 +1405,50 @@ class V4L2NcnnPoseSource:
         )
         self._last_analysis = analysis
         self._last_timestamp_ms = timestamp_ms
+        return analysis
+
+    def _missing(self, *, worker_timed_out: bool) -> V4L2NcnnPoseObservation:
+        timestamp_ms = self._now_ms()
         return V4L2NcnnPoseObservation(
-            analysis=analysis,
+            analysis=self._missing_analysis(timestamp_ms),
             frame_received=False,
+            detector_ms=None,
+            pose_ms=None,
             inference_ms=None,
             evidence_age_ms=None,
             person_score=None,
             timed_out=True,
+            capture_missed=False,
+            worker_timed_out=worker_timed_out,
+            parent_stale=False,
+        )
+
+    def _reject_stale(
+        self,
+        observation: V4L2NcnnPoseObservation,
+        *,
+        now_ms: int,
+    ) -> V4L2NcnnPoseObservation:
+        child_timestamp_ms = observation.analysis.timestamp_ms
+        evidence_age_ms = observation.evidence_age_ms
+        if child_timestamp_ms <= now_ms:
+            parent_observed_age_ms = float(now_ms - child_timestamp_ms)
+            evidence_age_ms = max(
+                parent_observed_age_ms,
+                evidence_age_ms if evidence_age_ms is not None else 0.0,
+            )
+        return V4L2NcnnPoseObservation(
+            analysis=self._missing_analysis(now_ms),
+            frame_received=observation.frame_received,
+            detector_ms=observation.detector_ms,
+            pose_ms=observation.pose_ms,
+            inference_ms=observation.inference_ms,
+            evidence_age_ms=evidence_age_ms,
+            person_score=None,
+            timed_out=True,
+            capture_missed=observation.capture_missed,
+            worker_timed_out=observation.worker_timed_out,
+            parent_stale=True,
         )
 
     def open(self) -> None:
@@ -1375,7 +1465,9 @@ class V4L2NcnnPoseSource:
         observation = self._worker.read(self._config.worker_timeout_seconds)
         if observation is None:
             self._failed = True
-            return self._missing()
+            return self._missing(
+                worker_timed_out=self._worker.failure_kind == "LocalPoseWorkerTimeout"
+            )
         now_ms = self._now_ms()
         timestamp_ms = observation.analysis.timestamp_ms
         stale = (
@@ -1384,7 +1476,7 @@ class V4L2NcnnPoseSource:
             or now_ms - timestamp_ms >= 500
         )
         if stale:
-            return self._missing()
+            return self._reject_stale(observation, now_ms=now_ms)
         self._last_analysis = observation.analysis
         self._last_timestamp_ms = timestamp_ms
         return observation
@@ -1425,7 +1517,13 @@ def run_v4l2_ncnn_pose_check(
     fresh_frames = 0
     assessable = 0
     timeouts = 0
+    capture_misses = 0
+    worker_timeouts = 0
+    parent_stale_count = 0
+    detector_ms: list[float] = []
+    pose_ms: list[float] = []
     inference_ms: list[float] = []
+    evidence_age_ms: list[float] = []
     try:
         source.open()
         while frames < frame_limit:
@@ -1435,12 +1533,21 @@ def run_v4l2_ncnn_pose_check(
             fresh_frames += int(observation.frame_received and not observation.timed_out)
             assessable += int(observation.analysis.assessable)
             timeouts += int(observation.timed_out)
+            capture_misses += int(observation.capture_missed)
+            worker_timeouts += int(observation.worker_timed_out)
+            parent_stale_count += int(observation.parent_stale)
+            if observation.detector_ms is not None:
+                detector_ms.append(observation.detector_ms)
+            if observation.pose_ms is not None:
+                pose_ms.append(observation.pose_ms)
             if observation.inference_ms is not None:
                 inference_ms.append(observation.inference_ms)
+            if observation.evidence_age_ms is not None:
+                evidence_age_ms.append(observation.evidence_age_ms)
     finally:
         source.close()
     return {
-        "service": "recoverybox-pi-v4l2-ncnn-check/v1",
+        "service": "recoverybox-pi-v4l2-ncnn-check/v2",
         "capture": "v4l2-mmap-yuyv",
         "conversion": "libyuv-yuy2-to-bgra",
         "estimator": "ncnn-nanodet-rtmpose",
@@ -1449,10 +1556,80 @@ def run_v4l2_ncnn_pose_check(
         "fresh_frames": fresh_frames,
         "assessable": assessable,
         "timeouts": timeouts,
+        "capture_misses": capture_misses,
+        "worker_timeouts": worker_timeouts,
+        "parent_stale_count": parent_stale_count,
+        "detector_ms_max": round(max(detector_ms), 3) if detector_ms else None,
+        "pose_ms_max": round(max(pose_ms), 3) if pose_ms else None,
         "inference_ms_max": round(max(inference_ms), 3) if inference_ms else None,
+        "evidence_age_ms_max": (round(max(evidence_age_ms), 3) if evidence_age_ms else None),
         "raw_frames_persisted": 0,
         "audio": "disabled",
     }
+
+
+def _acceptance_duration(value: object, *, nullable: bool = False) -> float | None:
+    if value is None and nullable:
+        return None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or not 0 <= value < 500
+    ):
+        raise ValueError("pose-check duration is invalid")
+    return float(value)
+
+
+def _successful_pose_check_report(report: Mapping[str, object], *, expected_frames: int) -> bool:
+    expected = {
+        "service": "recoverybox-pi-v4l2-ncnn-check/v2",
+        "capture": "v4l2-mmap-yuyv",
+        "conversion": "libyuv-yuy2-to-bgra",
+        "estimator": "ncnn-nanodet-rtmpose",
+        "frames": expected_frames,
+        "frames_received": expected_frames,
+        "fresh_frames": expected_frames,
+        "timeouts": 0,
+        "capture_misses": 0,
+        "worker_timeouts": 0,
+        "parent_stale_count": 0,
+        "raw_frames_persisted": 0,
+        "audio": "disabled",
+    }
+    if any(report.get(key) != value for key, value in expected.items()):
+        return False
+    if frozenset(report) != {
+        *expected,
+        "assessable",
+        "detector_ms_max",
+        "pose_ms_max",
+        "inference_ms_max",
+        "evidence_age_ms_max",
+    }:
+        return False
+    assessable = report.get("assessable")
+    if (
+        isinstance(assessable, bool)
+        or not isinstance(assessable, int)
+        or not 0 <= assessable <= expected_frames
+    ):
+        return False
+    try:
+        detector_ms = _acceptance_duration(report.get("detector_ms_max"))
+        pose_ms = _acceptance_duration(report.get("pose_ms_max"), nullable=True)
+        inference_ms = _acceptance_duration(report.get("inference_ms_max"))
+        evidence_age_ms = _acceptance_duration(report.get("evidence_age_ms_max"))
+    except ValueError:
+        return False
+    assert detector_ms is not None
+    assert inference_ms is not None
+    assert evidence_age_ms is not None
+    if assessable > 0 and pose_ms is None:
+        return False
+    return detector_ms <= inference_ms <= evidence_age_ms and (
+        pose_ms is None or pose_ms <= inference_ms
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1466,15 +1643,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     except Exception as exc:
         report = {
-            "service": "recoverybox-pi-v4l2-ncnn-check/v1",
+            "service": "recoverybox-pi-v4l2-ncnn-check/v2",
             "failure": type(exc).__name__,
             "raw_frames_persisted": 0,
             "audio": "disabled",
         }
         print(json.dumps(report, sort_keys=True))
         return 1
-    fresh_frames = report.get("fresh_frames")
-    if isinstance(fresh_frames, bool) or not isinstance(fresh_frames, int) or fresh_frames < 1:
+    if not _successful_pose_check_report(report, expected_frames=arguments.max_frames):
         report = {**report, "failure": "FreshPoseEvidenceUnavailable"}
         print(json.dumps(report, sort_keys=True))
         return 1

@@ -16,6 +16,7 @@ from recoverybox.core import (
     GuardianAction,
     GuardianDecision,
     GuardianReason,
+    GuardianRuntimeFault,
     LearnedSuggestion,
     LocalCueRequest,
     MovementObservation,
@@ -59,6 +60,49 @@ def test_safe_observation_continues(guardian: Guardian, plan: ExercisePlan) -> N
     assert decision.cue_id is None
     assert decision.reason_codes == (GuardianReason.WITHIN_LIMITS,)
     assert decision.rule_version == Guardian.RULE_VERSION
+
+
+@pytest.mark.parametrize(
+    ("fault", "action", "reason"),
+    (
+        (
+            GuardianRuntimeFault.REALTIME_UNAVAILABLE,
+            GuardianAction.PAUSE,
+            GuardianReason.REALTIME_UNAVAILABLE,
+        ),
+        (
+            GuardianRuntimeFault.CUE_DELIVERY_UNAVAILABLE,
+            GuardianAction.PAUSE,
+            GuardianReason.CUE_DELIVERY_UNAVAILABLE,
+        ),
+        (
+            GuardianRuntimeFault.INHERITED_CAUTION,
+            GuardianAction.PAUSE,
+            GuardianReason.INHERITED_RUNTIME_CAUTION,
+        ),
+        (
+            GuardianRuntimeFault.RUNTIME_BOUNDARY_FAILURE,
+            GuardianAction.PAUSE,
+            GuardianReason.RUNTIME_BOUNDARY_FAILURE,
+        ),
+        (
+            GuardianRuntimeFault.SAFETY_ENFORCEMENT_FAILURE,
+            GuardianAction.ESCALATE,
+            GuardianReason.SAFETY_ENFORCEMENT_FAILURE,
+        ),
+    ),
+)
+def test_runtime_faults_are_typed_sealed_guardian_decisions(
+    guardian: Guardian,
+    fault: GuardianRuntimeFault,
+    action: GuardianAction,
+    reason: GuardianReason,
+) -> None:
+    decision = guardian.decide_runtime_fault(fault)
+
+    assert guardian.issued(decision)
+    assert decision.action is action
+    assert decision.reason_codes == (reason,)
 
 
 def test_emergency_escalates_and_has_highest_priority(
@@ -382,7 +426,7 @@ def test_suggestion_and_decision_enforce_cue_invariants() -> None:
         LearnedSuggestion(GuardianAction.CUE)
     with pytest.raises(ValueError, match="cannot include cue_id"):
         LearnedSuggestion(GuardianAction.STOP, "cue")
-    with pytest.raises(ValueError, match="requires cue_id"):
+    with pytest.raises(TypeError, match="only be issued by Guardian"):
         GuardianDecision(
             GuardianAction.CUE,
             (GuardianReason.WITHIN_LIMITS,),
@@ -390,7 +434,7 @@ def test_suggestion_and_decision_enforce_cue_invariants() -> None:
         )
     with pytest.raises(TypeError, match="GuardianAction"):
         LearnedSuggestion("cue", CueId.MOVE_SLOWLY)  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="reason_codes"):
+    with pytest.raises(TypeError, match="only be issued by Guardian"):
         GuardianDecision(
             GuardianAction.CONTINUE,
             ("within_limits",),  # type: ignore[arg-type]

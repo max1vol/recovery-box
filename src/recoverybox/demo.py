@@ -13,7 +13,6 @@ from recoverybox.core import (
     LearnedSuggestion,
     LocalCueRequest,
     MovementObservation,
-    SessionMode,
 )
 from recoverybox.federation import PostSessionRepSummary, pose_window_to_post_session_record
 from recoverybox.pose import (
@@ -25,6 +24,7 @@ from recoverybox.pose import (
     PoseFeatureWindowBuilder,
     PoseViewSummary,
 )
+from recoverybox.realtime import SessionEndController
 from recoverybox.session import (
     ApprovedCuePlaybackAuthorization,
     SessionCoordinator,
@@ -82,9 +82,11 @@ def run_safety_demo() -> list[DemoEvent]:
     )
     feature_builder = PoseFeatureWindowBuilder(maximum_rows=8)
     cue_speaker = _DemoCueSpeaker()
+    end_controller = SessionEndController()
     coordinator = SessionCoordinator(
+        guardian=guardian,
         cue_playback=cue_speaker,
-        initial_mode=SessionMode.ACTIVE_EXERCISE,
+        session_end_authority=end_controller,
     )
     events: list[DemoEvent] = []
 
@@ -95,6 +97,9 @@ def run_safety_demo() -> list[DemoEvent]:
     )
     assert first.fused is not None
     feature_builder.add(first.fused)
+    coordinator.activate_after_guardian_continue(
+        guardian.decide(_observation(first.fused, timestamp_ms=1_100), plan)
+    )
     correction = guardian.decide(
         _observation(first.fused, timestamp_ms=1_100),
         plan,

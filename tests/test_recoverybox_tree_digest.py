@@ -13,6 +13,7 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _HELPER = _REPO_ROOT / "deploy" / "recoverybox_tree_digest.py"
+_POWER_HELPER = _REPO_ROOT / "deploy" / "recoverybox_pi_power_gate.py"
 _FORMAT_HEADER = b"recoverybox-application-tree-sha256\x00v1\x00"
 
 
@@ -46,6 +47,7 @@ def _application_tree(root: Path, *, reverse_creation: bool = False) -> Path:
     files = {
         root / "src" / "recoverybox" / "__init__.py": b'VALUE = "one"\n',
         root / "src" / "recoverybox" / "nested" / "worker.py": b"answer = 42\n",
+        root / "deploy" / "recoverybox_pi_power_gate.py": _POWER_HELPER.read_bytes(),
         root / "deploy" / "recoverybox_status.py": b"def main():\n    return 0\n",
         root / "deploy" / "recoverybox_tree_digest.py": _HELPER.read_bytes(),
     }
@@ -58,7 +60,11 @@ def _application_tree(root: Path, *, reverse_creation: bool = False) -> Path:
 def _reference_digest(root: Path) -> str:
     entries: list[tuple[str, bool, bytes]] = []
     entries.append(("deploy", True, b""))
-    for name in ("recoverybox_status.py", "recoverybox_tree_digest.py"):
+    for name in (
+        "recoverybox_pi_power_gate.py",
+        "recoverybox_status.py",
+        "recoverybox_tree_digest.py",
+    ):
         entries.append((f"deploy/{name}", False, (root / "deploy" / name).read_bytes()))
     entries.append(("src", True, b""))
     for path in (root / "src").rglob("*"):

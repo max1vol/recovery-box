@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import stat
 import sys
 import threading
 from collections.abc import Callable, Mapping, Sequence
@@ -194,7 +195,10 @@ class LocalPrimeConfig:
         if not isinstance(self.voice, str) or not self.voice.strip():
             raise LocalPrimeConfigurationError("voice must not be blank")
         token_file = Path(self.token_file).expanduser().resolve()
-        env_file = Path(self.env_file).expanduser().resolve()
+        # Keep the final path component unresolved so the credential loader can
+        # reject a caller-supplied symlink.  ``absolute()`` retains the existing
+        # absolute-path behavior without following the selected file.
+        env_file = Path(self.env_file).expanduser().absolute()
         status_file = Path(self.status_file).expanduser().resolve()
         object.__setattr__(self, "tailscale_ip", self.tailscale_ip.strip())
         object.__setattr__(self, "voice", self.voice.strip())
@@ -213,9 +217,62 @@ def load_local_openai_api_key(
     path = Path(env_file)
     from_file: str | None = None
     try:
-        lines = path.read_text(encoding="utf-8").splitlines() if path.is_file() else ()
+        metadata = path.lstat()
+    except FileNotFoundError:
+        lines: Sequence[str] = ()
     except OSError as exc:
         raise LocalPrimeConfigurationError("the selected .env file could not be read") from exc
+    else:
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise LocalPrimeConfigurationError(
+                "the selected .env file must be a private regular file"
+            )
+        if stat.S_IMODE(metadata.st_mode) & 0o066:
+            raise LocalPrimeConfigurationError(
+                "the selected .env file must not be readable or writable by group or others"
+            )
+
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as exc:
+            raise LocalPrimeConfigurationError(
+                "the selected .env file could not be opened safely"
+            ) from exc
+        try:
+            opened_metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened_metadata.st_mode)
+                or (metadata.st_dev, metadata.st_ino)
+                != (opened_metadata.st_dev, opened_metadata.st_ino)
+                or stat.S_IMODE(opened_metadata.st_mode) & 0o066
+            ):
+                raise LocalPrimeConfigurationError(
+                    "the selected .env file changed before it could be read safely"
+                )
+            chunks: list[bytes] = []
+            while chunk := os.read(descriptor, 65_536):
+                chunks.append(chunk)
+            after_read_metadata = os.fstat(descriptor)
+        except OSError as exc:
+            raise LocalPrimeConfigurationError(
+                "the selected .env file could not be read safely"
+            ) from exc
+        finally:
+            os.close(descriptor)
+        if (
+            (opened_metadata.st_dev, opened_metadata.st_ino)
+            != (after_read_metadata.st_dev, after_read_metadata.st_ino)
+            or stat.S_IMODE(after_read_metadata.st_mode) & 0o066
+            or after_read_metadata.st_size != sum(map(len, chunks))
+        ):
+            raise LocalPrimeConfigurationError(
+                "the selected .env file changed while it was being read"
+            )
+        try:
+            lines = b"".join(chunks).decode("utf-8").splitlines()
+        except UnicodeDecodeError as exc:
+            raise LocalPrimeConfigurationError("the selected .env file is not valid UTF-8") from exc
     for line in lines:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):

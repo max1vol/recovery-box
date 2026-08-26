@@ -30,13 +30,21 @@ SSH configuration, proxy commands, and jump hosts disabled. It verifies that
 the `pi` and root connections reach the same machine and that the target is the
 reviewed ARMv7 Pi 3 runtime: CPython 3.13, glibc 2.31 or newer, libgpiod 2.x,
 the libyuv `YUY2ToARGB` ABI, readable/writable `/dev/video0` and
-`/dev/gpiochip0`, and `pi` membership in `video` and `gpio`.
+`/dev/gpiochip0`, and `pi` membership in `video` and `gpio`. It also reads
+`vcgencmd get_throttled` three times, 250 ms apart. The current low-nibble flags
+must remain clear; sticky historical flags are reported but do not by
+themselves authorize or reject movement evidence. Unknown or malformed flags
+fail closed.
 
 Apply the direct replacement only after preflight succeeds:
 
 ```bash
-export OPENAI_API_KEY="your-project-api-key"
+chmod 600 .env
+set -a
+. ./.env
+set +a
 scripts/deploy-pi3.sh --apply
+unset OPENAI_API_KEY
 ```
 
 `--apply` is intentionally irreversible. It:
@@ -58,19 +66,30 @@ scripts/deploy-pi3.sh --apply
    `pi`; and
 7. installs and starts the root-owned RecoveryBox units as `pi`.
 
+The same three-sample power gate runs from the digest-verified staged helper
+immediately before the first service stop, immediately before pose acceptance,
+at both legacy-assistant termination/removal boundaries, and again after
+acceptance before either service starts. Thus a later active undervoltage or
+thermal-throttle condition cannot be hidden by an earlier preflight.
+`0xd0000` is historical-only; `0xd0005` is an active `0x5` failure. Never
+increase the pose deadline to work around a power failure.
+
 Every runtime/model file is checked by exact size and SHA-256 in the transfer
 stage, after activation, and through each running service's `/proc/<pid>/root`
 view. The running process environment is also checked for the exact local
 camera, buffer, FPS, timeout, runtime, and model values. A successful cutover
 requires a fresh numeric pose observation less than 500 ms old.
 
-The bounded acceptance report requires three acquired frames, at least one
-fresh frame, zero timeouts, `raw_frames_persisted=0`, `audio=disabled`, and
-maximum measured inference below 500 ms. `assessable=0` is valid in an empty or
-poorly framed room: it proves camera acquisition and the detector path, not a
-human RTMPose result. A reviewed synthetic-person fixture through the exact
-RTMPose runtime, a live fully framed person, and a sustained thermal run remain
-separate acceptance evidence.
+The closed `recoverybox-pi-v4l2-ncnn-check/v2` acceptance report requires three
+acquired fresh frames, zero aggregate timeouts, zero capture misses, zero
+worker timeouts, zero parent-stale rejections, `raw_frames_persisted=0`, and
+`audio=disabled`. Detector, total-inference, and end-to-end evidence-age maxima
+must each be finite and below 500 ms; pose time may be null only when no pose
+ran, such as an empty room. `assessable=0` is valid in an empty or poorly
+framed room: it proves camera acquisition and the detector path, not a human
+RTMPose result. A reviewed synthetic-person fixture through the exact RTMPose
+runtime, a live fully framed person, and a sustained thermal run remain separate
+acceptance evidence.
 
 ## Device and credential boundaries
 
@@ -97,6 +116,13 @@ timed-out, stale, low-confidence, multiple-person, or clipped-person evidence
 is non-assessable and cannot advance the exercise.
 
 ## Physical acceptance still required
+
+With the Pi powered off, connect a normally-open momentary switch between
+physical pin 16 (`BCM23`) and physical pin 14 (`GND`). No external voltage is
+used: the service requests an active-low input with pull-up bias. Power the Pi
+back on only after checking the wiring. A disconnected normally-open switch is
+not electrically distinguishable from a released switch, so the operator must
+also test an actual press.
 
 The automated suite does not establish physical rehabilitation accuracy. Before
 calling the Pi deployment fully accepted, record all of the following:

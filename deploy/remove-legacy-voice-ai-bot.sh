@@ -8,10 +8,13 @@ die() {
     exit 1
 }
 
-[[ $# -eq 3 ]] || die "expected ACCOUNT TAILSCALE_IPV4 MACHINE_ID"
+[[ $# -eq 5 ]] ||
+    die "expected ACCOUNT TAILSCALE_IPV4 MACHINE_ID POWER_GATE POWER_GATE_SHA256"
 readonly EXPECTED_ACCOUNT=$1
 readonly EXPECTED_TAILSCALE_IP=$2
 readonly EXPECTED_MACHINE_ID=$3
+readonly POWER_GATE=$4
+readonly POWER_GATE_SHA256=$5
 readonly MAIN_UNIT="voice-ai-bot.service"
 readonly DEBUG_UNIT="voice-ai-bot-debug.service"
 readonly MAIN_FRAGMENT="/etc/systemd/system/voice-ai-bot.service"
@@ -26,6 +29,23 @@ readonly APP_ROOT="/opt/voice-ai-bot"
 readonly STATE_ROOT="/var/lib/voice-ai-bot"
 readonly MAIN_RUNTIME="/run/voice-ai-bot"
 readonly DEBUG_RUNTIME="/run/voice-ai-bot-debug"
+
+run_power_gate() {
+    local stage_root stage_name
+    stage_root=${POWER_GATE%/app/deploy/recoverybox_pi_power_gate.py}
+    stage_name=${stage_root#/run/recoverybox-deploy-}
+    [[ $stage_root != "$POWER_GATE" && -n $stage_name && $stage_name != */* ]] ||
+        die "power gate is outside the exact deployment stage"
+    [[ $POWER_GATE_SHA256 =~ ^[0-9a-f]{64}$ ]] || die "power gate digest is invalid"
+    [[ -f $POWER_GATE && ! -L $POWER_GATE ]] || die "power gate is not a regular file"
+    [[ $(stat -c %U:%G "$POWER_GATE") == root:root ]] ||
+        die "power gate has an unexpected owner"
+    [[ $(stat -c %a "$POWER_GATE") == 644 ]] || die "power gate has an unexpected mode"
+    [[ $(stat -c %h "$POWER_GATE") == 1 ]] || die "power gate is hard-linked"
+    [[ $(sha256sum "$POWER_GATE" | awk '{print $1}') == "$POWER_GATE_SHA256" ]] ||
+        die "power gate digest changed"
+    /usr/bin/python3 "$POWER_GATE"
+}
 
 [[ $(id -u) -eq 0 ]] || die "run this exact helper as root (for example with sudo)"
 case "$EXPECTED_ACCOUNT" in
@@ -183,6 +203,10 @@ reject_nested_mounts \
 
 validate_legacy_enablement_links 1
 
+# The earlier deployment gate may precede a long validation transaction. Check
+# again on the exact root-owned helper immediately before any legacy process is
+# killed or stopped.
+run_power_gate
 for unit in "$MAIN_UNIT" "$DEBUG_UNIT"; do
     dropins=$(systemctl show --property=DropInPaths --value "$unit") ||
         die "could not inspect $unit drop-ins"
@@ -271,6 +295,7 @@ PY
 
 # These are the complete fixed legacy targets. They were all validated above;
 # no caller-supplied or glob-expanded path reaches rm.
+run_power_gate
 rm -f -- "$MAIN_WANT" "$DEBUG_WANT" "$MAIN_FRAGMENT" "$DEBUG_FRAGMENT"
 rm -rf --one-file-system -- \
     "$MAIN_DROPIN_ETC" "$DEBUG_DROPIN_ETC" "$MAIN_DROPIN_RUN" "$DEBUG_DROPIN_RUN" \

@@ -551,6 +551,7 @@ def test_deploy_builds_fresh_silent_pi_local_pose_environment() -> None:
     assert "scripts/fetch-pi-pose-ncnn-runtime.sh" in deploy
     assert "scripts/fetch-pi-pose-ncnn-models.sh" in deploy
     assert "scripts/verify-pi-pose-ncnn-assets.sh" in deploy
+    assert "deploy/recoverybox_pi_power_gate.py" in deploy
     # The Pi mounts the /run deployment stage noexec. Invoke the already
     # digest-verified shell helper through the trusted system shell.
     assert deploy.count('/bin/bash "$verifier" "$assets" root:root') == 1
@@ -575,7 +576,11 @@ def test_deploy_builds_fresh_silent_pi_local_pose_environment() -> None:
     assert "DevicePolicy=closed" in deploy
     assert 'b"OPENAI_API_KEY" in environment' in deploy
     assert "unset OPENAI_API_KEY" in deploy
-    assert "for command in ssh python3 tailscale; do" in deploy
+    assert "for command in ssh python3; do" in deploy
+    assert "tailscale_cli=$(command -v tailscale)" in deploy
+    assert "tailscale_cli=/Applications/Tailscale.app/Contents/MacOS/Tailscale" in deploy
+    assert '"$tailscale_cli" ip -4' in deploy
+    assert deploy.index('"$tailscale_cli" ip -4') < deploy.index("REMOTE_PI_PREFLIGHT")
     assert "for command in ssh python3 sha256sum tailscale; do" not in deploy
     assert "hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest()" in deploy
     assert "printf '%s' \"$openai_api_key\" | ssh" in deploy
@@ -644,7 +649,8 @@ def test_deploy_binds_staged_and_activated_app_to_fresh_local_tree_digest() -> N
     restart = "systemctl restart recoverybox.service recoverybox-status.service"
 
     assert "deploy/recoverybox_tree_digest.py" in deploy
-    assert "deploy/recoverybox_status.py deploy/recoverybox_tree_digest.py" in deploy
+    assert "deploy/recoverybox_pi_power_gate.py deploy/recoverybox_status.py" in deploy
+    assert "deploy/recoverybox_tree_digest.py" in deploy
     assert deploy.count(local_digest) == 2
     assert "--exclude=__pycache__/ --exclude='*.pyc'" in deploy
     assert deploy.count(streamed_helper) == 2
@@ -735,23 +741,37 @@ def test_deploy_runs_bounded_silent_local_pose_acceptance_before_service() -> No
     assert 'pose_check=$(\n    cd "$app"\n    timeout 45 runuser -u pi --' in deploy
     assert ") || pose_check_status=$?" in deploy
     assert 'python3 - "$pose_check" "$pose_check_status"' in deploy
-    assert (
-        'numeric_fields = ("frames_received", "fresh_frames", "timeouts", "inference_ms_max")'
-        in deploy
-    )
+    for diagnostic in (
+        '"capture_misses"',
+        '"worker_timeouts"',
+        '"parent_stale_count"',
+        '"detector_ms_max"',
+        '"pose_ms_max"',
+        '"inference_ms_max"',
+        '"evidence_age_ms_max"',
+    ):
+        assert diagnostic in deploy
     assert 'f"Pi pose acceptance failed: {failure}; "' in deploy
     assert "timeout 45 runuser -u pi" in deploy
-    assert '"service": "recoverybox-pi-v4l2-ncnn-check/v1"' in deploy
+    assert '"service": "recoverybox-pi-v4l2-ncnn-check/v2"' in deploy
     assert '"capture": "v4l2-mmap-yuyv"' in deploy
     assert '"conversion": "libyuv-yuy2-to-bgra"' in deploy
     assert '"estimator": "ncnn-nanodet-rtmpose"' in deploy
     assert '"frames_received": 3' in deploy
-    assert '"fresh_frames"' in deploy
-    assert 'not 1 <= fresh_frames <= report["frames_received"]' in deploy
+    assert '"fresh_frames": 3' in deploy
     assert '"timeouts": 0' in deploy
+    assert '"capture_misses": 0' in deploy
+    assert '"worker_timeouts": 0' in deploy
+    assert '"parent_stale_count": 0' in deploy
     assert '"raw_frames_persisted": 0' in deploy
     assert '"audio": "disabled"' in deploy
-    assert "inference_ms < 500" in deploy
+    assert 'bounded_duration("detector_ms_max")' in deploy
+    assert 'bounded_duration("pose_ms_max", nullable=True)' in deploy
+    assert 'bounded_duration("inference_ms_max")' in deploy
+    assert 'bounded_duration("evidence_age_ms_max")' in deploy
+    assert "pose_ms is not None and pose_ms > inference_ms" in deploy
+    assert "inference_ms > evidence_age_ms" in deploy
+    assert 'report["assessable"] > 0 and pose_ms is None' in deploy
     assert "recoverybox.remote_pose_smoke" not in deploy
     assert "timeout 10 systemctl restart recoverybox.service" not in deploy
     assert 'status.get("service") != "local"' in deploy
@@ -768,7 +788,101 @@ def test_deploy_runs_bounded_silent_local_pose_acceptance_before_service() -> No
     assert deploy.index(process_proof) < deploy.index(endpoint)
 
 
-def test_legacy_deletion_helper_accepts_no_paths_and_names_exact_targets() -> None:
+def test_deploy_pose_v2_parser_executes_strict_empty_room_and_failure_contracts() -> None:
+    deploy = (_REPO_ROOT / "scripts" / "deploy-pi3.sh").read_text(encoding="utf-8")
+    opening = 'python3 - "$pose_check" "$pose_check_status" <<\'PY\'\n'
+    start = deploy.index(opening) + len(opening)
+    end = deploy.index('\nPY\n/usr/bin/python3 "$power_gate"', start)
+    parser = deploy[start:end]
+    base = {
+        "service": "recoverybox-pi-v4l2-ncnn-check/v2",
+        "capture": "v4l2-mmap-yuyv",
+        "conversion": "libyuv-yuy2-to-bgra",
+        "estimator": "ncnn-nanodet-rtmpose",
+        "frames": 3,
+        "frames_received": 3,
+        "fresh_frames": 3,
+        "assessable": 0,
+        "timeouts": 0,
+        "capture_misses": 0,
+        "worker_timeouts": 0,
+        "parent_stale_count": 0,
+        "detector_ms_max": 8.0,
+        "pose_ms_max": None,
+        "inference_ms_max": 8.0,
+        "evidence_age_ms_max": 20.0,
+        "raw_frames_persisted": 0,
+        "audio": "disabled",
+    }
+
+    accepted = subprocess.run(
+        [sys.executable, "-c", parser, json.dumps(base), "0"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert accepted.returncode == 0
+    assert accepted.stdout == ""
+    assert accepted.stderr == ""
+
+    partial = {
+        **base,
+        "frames_received": 1,
+        "fresh_frames": 1,
+        "timeouts": 2,
+        "capture_misses": 2,
+        "failure": "FreshPoseEvidenceUnavailable",
+    }
+    rejected = subprocess.run(
+        [sys.executable, "-c", parser, json.dumps(partial), "1"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert rejected.returncode == 1
+    assert rejected.stdout == ""
+    assert "capture_misses=2" in rejected.stderr
+    assert "worker_timeouts=0" in rejected.stderr
+
+    impossible_pose_timing = {**base, "pose_ms_max": 40.0, "inference_ms_max": 20.0}
+    rejected = subprocess.run(
+        [sys.executable, "-c", parser, json.dumps(impossible_pose_timing), "0"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert rejected.returncode == 1
+    assert rejected.stdout == ""
+
+
+def test_deploy_power_gate_precedes_destructive_and_runtime_actions() -> None:
+    deploy = (_REPO_ROOT / "scripts" / "deploy-pi3.sh").read_text(encoding="utf-8")
+
+    staged_gate = '/usr/bin/python3 "$power_gate"'
+    positions: list[int] = []
+    offset = 0
+    while True:
+        position = deploy.find(staged_gate, offset)
+        if position < 0:
+            break
+        positions.append(position)
+        offset = position + 1
+
+    assert len(positions) == 3
+    assert "<deploy/recoverybox_pi_power_gate.py" in deploy
+    assert deploy.index("<deploy/recoverybox_pi_power_gate.py") < deploy.index("if ((!apply))")
+    assert positions[0] < deploy.index('timeout 10 systemctl stop "$unit"')
+    assert positions[1] < deploy.index("pose_check=$(")
+    assert deploy.index("Pi pose acceptance failed:") < positions[2]
+    assert positions[2] < deploy.index(
+        "systemctl enable recoverybox.service recoverybox-status.service"
+    )
+    assert "timeout 45 runuser -u pi" in deploy
+    assert '"RECOVERYBOX_LOCAL_POSE_WORKER_TIMEOUT_SECONDS": "0.5"' in deploy
+    assert '"RECOVERYBOX_LOCAL_POSE_MAX_AGE_SECONDS": "0.5"' in deploy
+
+
+def test_legacy_deletion_helper_names_fixed_targets_and_strict_staged_power_gate() -> None:
     cleanup = (_DEPLOY_ROOT / "remove-legacy-voice-ai-bot.sh").read_text(encoding="utf-8")
 
     for exact_target in (
@@ -784,6 +898,15 @@ def test_legacy_deletion_helper_accepts_no_paths_and_names_exact_targets() -> No
     assert '"$APP_ROOT" "$STATE_ROOT" "$MAIN_RUNTIME" "$DEBUG_RUNTIME"' in cleanup
     assert "validate_legacy_enablement_links 0" in cleanup
     assert 'systemctl disable "$unit"' not in cleanup
+    assert cleanup.count("run_power_gate\n") == 2
+    first_gate = cleanup.index("run_power_gate\n")
+    second_gate = cleanup.index("run_power_gate\n", first_gate + 1)
+    assert first_gate < cleanup.index('for unit in "$MAIN_UNIT" "$DEBUG_UNIT"')
+    assert second_gate < cleanup.index('rm -f -- "$MAIN_WANT"')
+    assert '/usr/bin/python3 "$POWER_GATE"' in cleanup
+    assert '"$remote_app_stage/deploy/recoverybox_pi_power_gate.py"' in (
+        _REPO_ROOT / "scripts" / "deploy-pi3.sh"
+    ).read_text(encoding="utf-8")
 
 
 def test_legacy_deletion_helper_rejects_extra_arguments_before_root_work() -> None:
@@ -803,7 +926,8 @@ def test_legacy_deletion_helper_rejects_extra_arguments_before_root_work() -> No
     )
 
     assert result.returncode != 0
-    assert "expected ACCOUNT TAILSCALE_IPV4 MACHINE_ID" in result.stderr
+    expected = "expected ACCOUNT TAILSCALE_IPV4 MACHINE_ID POWER_GATE POWER_GATE_SHA256"
+    assert expected in result.stderr
 
 
 def test_pi_deployment_docs_describe_local_pose_and_remaining_physical_evidence() -> None:
@@ -818,6 +942,11 @@ def test_pi_deployment_docs_describe_local_pose_and_remaining_physical_evidence(
     assert "only `openai-api-key`" in documentation
     assert "local pose loads no remote-pose token" in documentation
     assert "`assessable=0` is valid" in documentation
+    assert "physical pin 16 (`BCM23`)" in documentation
+    assert "physical pin 14 (`GND`)" in documentation
+    assert "normally-open momentary switch" in documentation
+    assert "three-sample power gate" in documentation
+    assert "`0xd0005` is an active `0x5` failure" in documentation
     assert "not a human RTMPose result" in " ".join(documentation.split())
     assert "sustained capture-to-numeric age below 500 ms" in documentation
     assert "`/dev/snd` is not allowed" in documentation

@@ -87,6 +87,14 @@ without waiting for inference to return. The deployed V4L2 configuration is
 640x480 YUYV at requested 10 FPS with eight mmap buffers; each cycle drains old
 ready buffers before accepting the newest capture for inference.
 
+The bounded acceptance command emits the closed
+`recoverybox-pi-v4l2-ncnn-check/v2` numeric schema. It separates camera misses,
+worker timeouts, and parent-side stale rejection, and reports maxima for the
+detector, pose (nullable when no pose ran), total inference, and end-to-end
+evidence age. Parent rejection preserves only truthful timing/capture
+diagnostics while replacing analysis with `CAMERA_TIMEOUT`, clearing person
+confidence, and exposing no geometry or frame bytes.
+
 ## Live Pi 3 evidence from 2026-08-26
 
 The device was a Raspberry Pi 3 running armv7 Raspberry Pi OS 13 and CPython
@@ -111,3 +119,10 @@ synthetic-person fixture through the exact RTMPose runtime, a fully framed human
 RTMPose result, and sustained non-throttled capture-to-Guardian age below 500 ms
 remain separate acceptance evidence. Do not weaken the no-person, ambiguity,
 crop, confidence, or freshness gates to obtain it.
+
+Deployment now reads `vcgencmd get_throttled` through a digest-verified,
+stdlib-only helper. It requires three consecutive samples with no current
+low-nibble flags before replacement and on both sides of the bounded pose
+acceptance. Sticky high-bit history is retained as a numeric diagnostic, while
+active or unknown flags fail closed. This keeps power integrity separate from
+pose accuracy and leaves the 500 ms Guardian freshness boundary unchanged.
