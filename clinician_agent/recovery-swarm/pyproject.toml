@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "recovery-swarm"
+version = "0.1.0"
+description = "Recovery Swarm: a clinician-reviewable draft recovery-plan AgentApp"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "max1vol" }]
+dependencies = [
+  "flwr>=1.35.0,<1.36.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<9",
+  "ruff>=0.11,<1",
+]
+
+[project.scripts]
+recovery-swarm = "recovery_swarm.cli:main"
+
+[project.urls]
+Repository = "https://github.com/max1vol/recovery-box"
+
+[tool.hatch.build.targets.wheel]
+packages = ["recovery_swarm"]
+
+[tool.flwr.app]
+publisher = "max1vol"
+fab-format-version = 1
+flwr-version-target = "1.35.0"
+fab-include = [
+  "recovery_swarm/**/*.py",
+  "README.md",
+  "LICENSE",
+]
+
+[tool.flwr.app.config.agent]
+input = "/demo"
+model = "openai/gpt-5.5"
+plan-request-json = ""
+
+[tool.flwr.app.components]
+agentapp = "recovery_swarm.agent_app:app"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

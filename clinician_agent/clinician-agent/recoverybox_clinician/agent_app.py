@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 from typing import Any
 
 from .input import parse_question, parse_session_summaries_json
@@ -31,10 +32,37 @@ def _persist_report(context: Any, report_json: str, markdown: str) -> None:
         context.state["clinician-review"] = payload
 
 
+def _locked(context: Any) -> Any:
+    locked = getattr(context, "locked", None)
+    return locked() if callable(locked) else nullcontext()
+
+
+def _emit_report(agent: Any, context: Any, markdown: str) -> None:
+    if ConfigRecord is not None:
+        assistant_json = json.dumps(
+            {"type": "message", "role": "assistant", "content": markdown},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        with _locked(context):
+            items = context.state.setdefault("items", ConfigRecord({"json": []}))
+            encoded_items = items.get("json")
+            if not isinstance(encoded_items, list):
+                raise TypeError("Flower conversation items must be a list")
+            encoded_items.append(assistant_json)
+
+    events = getattr(agent, "events", None)
+    if events is None:
+        return
+    try:
+        events.emit({"type": "response.output_text.delta", "delta": markdown})
+        events.emit({"type": "response.completed"})
+    except RuntimeError:
+        return
+
+
 def run_agent_task(agent: Any, context: Any) -> str:
     """Validate input, persist the authoritative report, and emit that exact report."""
-    del agent  # This read-only prototype deliberately has no model or connector access.
-
     unsupported_keys = {"agent.model", "agent.use-model"}.intersection(context.run_config)
     if unsupported_keys:
         keys = ", ".join(sorted(unsupported_keys))
@@ -51,6 +79,7 @@ def run_agent_task(agent: Any, context: Any) -> str:
     markdown = render_markdown(report)
     report_json = json.dumps(report.as_dict(), sort_keys=True, separators=(",", ":"))
     _persist_report(context, report_json, markdown)
+    _emit_report(agent, context, markdown)
     print(markdown)
     return markdown
 

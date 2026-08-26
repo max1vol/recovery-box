@@ -1,0 +1,46 @@
+{
+  "schema": "recoverybox.plan-request.v1",
+  "synthetic": true,
+  "request_id": "SYNTH-REQUEST-001",
+  "clinician_diagnosis": {
+    "diagnosis_code": "SYNTH-DX-KNEE-01",
+    "treatment_envelope": {
+      "approved_exercises": [
+        {
+          "exercise_id": "seated-knee-extension",
+          "sets": 2,
+          "reps": 8,
+          "duration_seconds": 240,
+          "required_equipment": [
+            "CHAIR"
+          ]
+        }
+      ],
+      "allowed_weekly_frequency": {
+        "minimum": 2,
+        "maximum": 3
+      },
+      "contraindication_codes": [
+        "SYNTH-CI-ACUTE-PAIN"
+      ],
+      "review_date": "2026-09-30"
+    }
+  },
+  "user_preferences": {
+    "available_days": [
+      "MONDAY",
+      "WEDNESDAY",
+      "FRIDAY"
+    ],
+    "preferred_time": "MORNING",
+    "max_minutes": 20,
+    "equipment": [
+      "CHAIR"
+    ],
+    "coaching_style": "ENCOURAGING",
+    "language": "en",
+    "accessibility": [
+      "LARGE_TEXT"
+    ]
+  }
+}

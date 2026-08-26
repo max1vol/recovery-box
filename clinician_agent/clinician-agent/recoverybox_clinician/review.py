@@ -30,10 +30,55 @@ _UNSUPPORTED_REQUESTS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bemergency\b|\btriage\b", re.I), "emergency triage"),
 )
 
+_BOUNDARY_DISCLAIMER_WORDS = frozenset(
+    {
+        "and",
+        "change",
+        "control",
+        "device",
+        "diagnose",
+        "diagnosis",
+        "do",
+        "dose",
+        "drug",
+        "exercise",
+        "increase",
+        "medication",
+        "medicine",
+        "must",
+        "never",
+        "not",
+        "or",
+        "plan",
+        "prescribe",
+        "prescribing",
+        "reps",
+        "restart",
+        "set",
+        "start",
+        "stop",
+        "the",
+        "unlock",
+    }
+)
+
+
+def _without_boundary_disclaimers(question: str) -> str:
+    kept: list[str] = []
+    for sentence in re.split(r"(?<=[.!?])\s+", question):
+        words = re.findall(r"[a-z]+", sentence.lower())
+        negated = words[:2] == ["do", "not"] or words[:2] == ["must", "not"]
+        negated = negated or words[:1] == ["never"]
+        is_boundary_only = negated and set(words).issubset(_BOUNDARY_DISCLAIMER_WORDS)
+        if not is_boundary_only:
+            kept.append(sentence)
+    return " ".join(kept)
+
 
 def _scope_for(question: str) -> tuple[str, str]:
+    scope_text = _without_boundary_disclaimers(question)
     blocked = sorted(
-        {label for pattern, label in _UNSUPPORTED_REQUESTS if pattern.search(question)}
+        {label for pattern, label in _UNSUPPORTED_REQUESTS if pattern.search(scope_text)}
     )
     if blocked:
         return (

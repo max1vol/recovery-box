@@ -121,3 +121,16 @@ def test_unsupported_clinical_or_control_requests_are_blocked(question: str) -> 
     assert "cannot provide" in report.scope_message
     assert "No diagnosis, prescription, triage, or device action was produced." in markdown
     assert "Review queue" not in markdown
+
+
+def test_negated_safety_boundary_is_not_misread_as_a_request() -> None:
+    question = (
+        "Review these de-identified sessions and rank which needs clinician review first. "
+        "Cite the session and evidence for each concern; summarize shared patterns and limits. "
+        "Do not diagnose, prescribe, change the plan, or control the device."
+    )
+
+    report = build_review_report(question, (session("sess-test-001"),))
+
+    assert report.scope_status == "supported"
+    assert report.queue[0].session_id == "sess-test-001"

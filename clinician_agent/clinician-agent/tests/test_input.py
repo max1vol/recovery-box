@@ -69,3 +69,24 @@ def test_question_rejects_obvious_direct_contact_details() -> None:
 
     with pytest.raises(ValidationError, match="cannot contain"):
         parse_question("Review the record for clinician@example.test")
+
+    with pytest.raises(ValidationError, match="cannot contain"):
+        parse_question("Review the record and call +1 (415) 555-0198")
+
+
+def test_question_accepts_iso_session_dates_and_rep_fractions() -> None:
+    question = (
+        "Review de-identified sessions S1: 2026-08-20, 5/10 reps; "
+        "S2: 2026-08-21, 3/10 reps, SHARP_PAIN_REPORTED."
+    )
+
+    assert parse_question(question) == question
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    ["2026-99-99", "2026-02-30", "+1 (415) 555-2671", "415-555-2671", "12345678"],
+)
+def test_question_rejects_invalid_date_shapes_and_phone_numbers(candidate: str) -> None:
+    with pytest.raises(ValidationError, match="cannot contain"):
+        parse_question(f"Review session {candidate}")

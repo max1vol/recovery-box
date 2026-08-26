@@ -4,15 +4,30 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import date
 from typing import Any
 
 from .models import SessionSummary, ValidationError
 
 _EMAIL_PATTERN = re.compile(r"\b[^\s@]+@[^\s@]+\.[^\s@]+\b")
-_PHONE_PATTERN = re.compile(r"(?<!\d)(?:\+?\d[\s().-]*){8,}(?!\d)")
+_PHONE_PATTERN = re.compile(r"(?<!\d)\+?\d(?:[\s().-]*\d){7,}(?!\d)")
+_ISO_DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
 _MAX_QUESTION_LENGTH = 500
 _MAX_PAYLOAD_BYTES = 1_000_000
 _MAX_SESSIONS = 1_000
+
+
+def _contains_phone_number(value: str) -> bool:
+    for match in _PHONE_PATTERN.finditer(value):
+        candidate = match.group(0)
+        if _ISO_DATE_PATTERN.fullmatch(candidate) is not None:
+            try:
+                date.fromisoformat(candidate)
+            except ValueError:
+                return True
+            continue
+        return True
+    return False
 
 
 def parse_question(value: object) -> str:
@@ -22,7 +37,7 @@ def parse_question(value: object) -> str:
     question = " ".join(value.split())
     if len(question) > _MAX_QUESTION_LENGTH:
         raise ValidationError(f"agent.input must be at most {_MAX_QUESTION_LENGTH} characters")
-    if _EMAIL_PATTERN.search(question) or _PHONE_PATTERN.search(question):
+    if _EMAIL_PATTERN.search(question) or _contains_phone_number(question):
         raise ValidationError("agent.input cannot contain email addresses or phone numbers")
     return question
 
